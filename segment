@@ -1,0 +1,257 @@
+import os
+import sys
+import csv
+import math
+import argparse
+import itertools
+from collections import Counter
+import numpy as np
+REAL_DIR = 'real_images'
+COMP_DIR = 'composite'
+MASK_DIR = 'masks'
+OUT_DIR = 'order_oracle_out'
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(THIS_DIR, 'src', 'train', 'harmonizer', 'module'))
+import torch
+import torch.nn.functional as F
+try:
+    from PIL import Image
+except ImportError:
+    raise SystemExit('Pillow is required:  pip install pillow')
+import filter as filter_mod
+CANONICAL_FILTERS = [filter_mod.Filter.TEMPERATURE, filter_mod.Filter.BRIGHTNESS, filter_mod.Filter.CONTRAST, filter_mod.Filter.SATURATION, filter_mod.Filter.HIGHLIGHT, filter_mod.Filter.SHADOW]
+FILTER_RANGES = [0.3, 0.5, 0.5, 0.6, 0.4, 0.4]
+FILTER_NAMES = [f.name.lower() for f in CANONICAL_FILTERS]
+N_FILTERS = len(CANONICAL_FILTERS)
+def build_filter_modules(device):
+    mods = [filter_mod.FILTER_MODULES[ft]().to(device) for ft in CANONICAL_FILTERS]
+    return mods
+def apply_in_order(image, mask, args_scaled, filter_mods, order):
+    out = image
+    base = image
+    for i in order:
+        a = args_scaled[i].view(-1, 1, 1, 1)
+        filtered = filter_mods[i](out, a)
+        out = filtered * mask + base * (1 - mask)
+    return out
+def render_with_args(comp, mask, args_scaled_np, filter_mods, order, device):
+    with torch.no_grad():
+        a = torch.from_numpy(np.asarray(args_scaled_np, dtype=np.float32)).to(device)
+        args_list = [a[i].view(1) for i in range(N_FILTERS)]
+        out = apply_in_order(comp, mask, args_list, filter_mods, order)
+    return out
+def save_image(tensor, path):
+    arr = tensor.detach().clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy()
+    arr = (arr * 255.0 + 0.5).astype(np.uint8)
+    Image.fromarray(arr).save(path)
+def save_argument_image(values, names, save_path, title=None):
+    from PIL import ImageDraw, ImageFont
+    (bar_h, label_w, bar_area, pad) = (40, 130, 300, 12)
+    img_w = label_w + bar_area + pad * 2
+    title_h = 26 if title else 0
+    img_h = len(values) * (bar_h + pad) + pad + title_h
+    canvas = Image.new('RGB', (img_w, img_h), (245, 245, 245))
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.truetype('arial.ttf', 14)
+    except Exception:
+        font = ImageFont.load_default()
+    if title:
+        draw.text((pad, 6), title, fill=(20, 20, 20), font=font)
+    mid_x = label_w + bar_area // 2
+    for (i, (name, val)) in enumerate(zip(names, values)):
+        y0 = title_h + pad + i * (bar_h + pad)
+        y1 = y0 + bar_h
+        draw.text((pad, y0 + bar_h // 4), name, fill=(40, 40, 40), font=font)
+        draw.rectangle([label_w, y0 + 8, label_w + bar_area, y1 - 8], fill=(210, 210, 210))
+        draw.line([(mid_x, y0 + 4), (mid_x, y1 - 4)], fill=(150, 150, 150), width=1)
+        v = max(-1.0, min(1.0, float(val)))
+        bar_len = int(abs(v) * (bar_area // 2))
+        color = (80, 180, 80) if v >= 0 else (220, 70, 70)
+        if v >= 0:
+            draw.rectangle([mid_x, y0 + 8, mid_x + bar_len, y1 - 8], fill=color)
+        else:
+            draw.rectangle([mid_x - bar_len, y0 + 8, mid_x, y1 - 8], fill=color)
+        draw.text((mid_x + bar_area // 2 - 46, y0 + bar_h // 4), f'{float(val):+.4f}', fill=(40, 40, 40), font=font)
+    canvas.save(save_path)
+def fmse(pred, gt, mask):
+    diff2 = (pred - gt) ** 2
+    num = torch.sum(diff2 * mask, dim=(1, 2, 3))
+    den = torch.sum(mask, dim=(1, 2, 3)) + 1e-06
+    return torch.mean(num / den)
+def load_image(path, device):
+    img = Image.open(path).convert('RGB')
+    arr = np.asarray(img).astype(np.float32) / 255.0
+    t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+    return t.to(device)
+def load_mask(path, like, device):
+    (_, _, H, W) = like.shape
+    if path is None or not os.path.exists(path):
+        return torch.ones(1, 1, H, W, device=device)
+    m = Image.open(path).convert('L')
+    arr = np.asarray(m).astype(np.float32) / 255.0
+    t = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(device)
+    if t.shape[-2:] != (H, W):
+        t = F.interpolate(t, size=(H, W), mode='bilinear', align_corners=False)
+    return (t > 0.5).float()
+def optimise_args_for_order(comp, gt, mask, filter_mods, order, steps, lr, tol=1e-06, patience=25):
+    raw = torch.zeros(N_FILTERS, requires_grad=True, device=comp.device)
+    ranges = torch.tensor(FILTER_RANGES, device=comp.device)
+    opt = torch.optim.Adam([raw], lr=lr)
+    best = math.inf
+    best_args = None
+    stale = 0
+    used = 0
+    converged = False
+    for step in range(steps):
+        used = step + 1
+        opt.zero_grad()
+        args_unit = torch.tanh(raw)
+        args_scaled = args_unit * ranges
+        args_list = [args_scaled[i].view(1) for i in range(N_FILTERS)]
+        out = apply_in_order(comp, mask, args_list, filter_mods, order)
+        loss = fmse(out, gt, mask)
+        loss.backward()
+        opt.step()
+        v = loss.item()
+        if v < best - tol:
+            best = v
+            best_args = (torch.tanh(raw.detach()) * ranges).cpu().numpy().copy()
+            stale = 0
+        else:
+            if v < best:
+                best = v
+                best_args = (torch.tanh(raw.detach()) * ranges).cpu().numpy().copy()
+            stale += 1
+            if stale >= patience:
+                converged = True
+                break
+    return (best, best_args, used, converged)
+def get_orders(num_orders, seed=0):
+    all_perms = list(itertools.permutations(range(N_FILTERS)))
+    if num_orders is None or num_orders >= len(all_perms):
+        return all_perms
+    rng = np.random.default_rng(seed)
+    canonical = tuple(range(N_FILTERS))
+    reverse = tuple(reversed(range(N_FILTERS)))
+    chosen = {canonical, reverse}
+    while len(chosen) < num_orders:
+        chosen.add(tuple(rng.permutation(N_FILTERS)))
+    return list(chosen)
+def main():
+    ap = argparse.ArgumentParser(description='Per-order oracle fMSE sweep for the order-ceiling question.')
+    ap.add_argument('--real-dir', default=REAL_DIR)
+    ap.add_argument('--comp-dir', default=COMP_DIR)
+    ap.add_argument('--mask-dir', default=MASK_DIR)
+    ap.add_argument('--out-dir', default=OUT_DIR)
+    ap.add_argument('--num-orders', type=int, default=720, help='how many orders to try (<=720). Default 720 = exhaustive.')
+    ap.add_argument('--steps', type=int, default=300, help='max Adam steps per (image,order) -- safety cap; early-stops on convergence.')
+    ap.add_argument('--lr', type=float, default=0.05, help='Adam learning rate.')
+    ap.add_argument('--tol', type=float, default=1e-06, help='min fMSE improvement to count as progress (convergence tolerance).')
+    ap.add_argument('--patience', type=int, default=25, help="stop an order's optimisation after this many steps without > tol improvement.")
+    ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    args = ap.parse_args()
+    device = torch.device(args.device)
+    os.makedirs(args.out_dir, exist_ok=True)
+    filter_mods = build_filter_modules(device)
+    if not os.path.isdir(args.real_dir) or not os.path.isdir(args.comp_dir):
+        raise SystemExit(f"Create the folders '{args.real_dir}' and '{args.comp_dir}' and put paired images (same filenames) in them, then re-run.")
+    real_files = {f for f in os.listdir(args.real_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))}
+    comp_files = {f for f in os.listdir(args.comp_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))}
+    names = sorted(real_files & comp_files)
+    if not names:
+        raise SystemExit('No matching filenames found in real_images/ and composite/.')
+    orders = get_orders(args.num_orders)
+    print(f'Images: {len(names)} | Orders: {len(orders)} | steps={args.steps} lr={args.lr} | device={device}')
+    print(f'Total optimisations: {len(names) * len(orders)}')
+    def order_label(o):
+        return '>'.join((FILTER_NAMES[i] for i in o))
+    fmse_table = {}
+    best_args_rows = []
+    per_image_best = []
+    argmin_counter = Counter()
+    for name in names:
+        comp = load_image(os.path.join(args.comp_dir, name), device)
+        gt = load_image(os.path.join(args.real_dir, name), device)
+        if comp.shape != gt.shape:
+            gt = F.interpolate(gt, size=comp.shape[-2:], mode='bilinear', align_corners=False)
+        mask_path = os.path.join(args.mask_dir, name)
+        mask = load_mask(mask_path if os.path.isdir(args.mask_dir) else None, comp, device)
+        row = {}
+        order_args = {}
+        for (oi, order) in enumerate(orders):
+            (best, best_args, used, converged) = optimise_args_for_order(comp, gt, mask, filter_mods, order, args.steps, args.lr, tol=args.tol, patience=args.patience)
+            row[oi] = best
+            order_args[oi] = best_args
+            best_args_rows.append([name, order_label(order)] + [f'{a:.5f}' for a in best_args])
+        fmse_table[name] = row
+        best_oi = min(row, key=row.get)
+        worst_oi = max(row, key=row.get)
+        best_lbl = order_label(orders[best_oi])
+        worst_lbl = order_label(orders[worst_oi])
+        argmin_counter[best_lbl] += 1
+        per_image_best.append([name, best_lbl, f'{row[best_oi]:.6f}', f'{row[worst_oi]:.6f}', f'{row[worst_oi] - row[best_oi]:.6f}'])
+        print(f'  {name}: best={best_lbl} ({row[best_oi]:.5f})  worst={worst_lbl} ({row[worst_oi]:.5f})  gap={row[worst_oi] - row[best_oi]:.5f}')
+        stem = os.path.splitext(name)[0]
+        img_out = os.path.join(args.out_dir, 'images', stem)
+        os.makedirs(img_out, exist_ok=True)
+        save_image(gt, os.path.join(img_out, 'gt.png'))
+        save_image(comp, os.path.join(img_out, 'composite.png'))
+        best_img = render_with_args(comp, mask, order_args[best_oi], filter_mods, orders[best_oi], device)
+        worst_img = render_with_args(comp, mask, order_args[worst_oi], filter_mods, orders[worst_oi], device)
+        save_image(best_img, os.path.join(img_out, f'best__{best_lbl}__fmse{row[best_oi]:.5f}.png'))
+        save_image(worst_img, os.path.join(img_out, f'worst__{worst_lbl}__fmse{row[worst_oi]:.5f}.png'))
+        ranges_np = np.array(FILTER_RANGES, dtype=np.float32)
+        best_unit = order_args[best_oi] / ranges_np
+        worst_unit = order_args[worst_oi] / ranges_np
+        save_argument_image(best_unit, FILTER_NAMES, os.path.join(img_out, 'best_args.png'), title=f'BEST order: {best_lbl}  (fMSE {row[best_oi]:.5f})')
+        save_argument_image(worst_unit, FILTER_NAMES, os.path.join(img_out, 'worst_args.png'), title=f'WORST order: {worst_lbl}  (fMSE {row[worst_oi]:.5f})')
+    with open(os.path.join(args.out_dir, 'fmse_table.csv'), 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['image'] + [order_label(o) for o in orders])
+        for name in names:
+            w.writerow([name] + [f'{fmse_table[name][oi]:.6f}' for oi in range(len(orders))])
+    with open(os.path.join(args.out_dir, 'per_image_best.csv'), 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['image', 'best_order', 'best_fmse', 'worst_fmse', 'gap'])
+        w.writerows(per_image_best)
+    with open(os.path.join(args.out_dir, 'best_args.csv'), 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['image', 'order'] + FILTER_NAMES)
+        w.writerows(best_args_rows)
+    n_img = len(names)
+    distinct_best = len(argmin_counter)
+    (top_order, top_count) = argmin_counter.most_common(1)[0]
+    gaps = [float(r[4]) for r in per_image_best]
+    mean_gap = sum(gaps) / len(gaps)
+    max_gap = max(gaps)
+    lines = []
+    lines.append('ORDER-CEILING ORACLE EXPERIMENT - SUMMARY')
+    lines.append('=' * 48)
+    lines.append(f'images={n_img}  orders_tried={len(orders)}  max_steps={args.steps}  lr={args.lr}  patience={args.patience}')
+    lines.append('')
+    lines.append(f'distinct best-orders across images : {distinct_best}')
+    lines.append(f'most common best-order             : {top_order}  ({top_count}/{n_img} images)')
+    lines.append(f'mean best-vs-worst fMSE gap        : {mean_gap:.6f}')
+    lines.append(f'max  best-vs-worst fMSE gap        : {max_gap:.6f}')
+    lines.append('')
+    lines.append('Top best-orders (#images : order):')
+    for (lbl, c) in argmin_counter.most_common(10):
+        lines.append(f'  {c:3d}  {lbl}')
+    lines.append('')
+    lines.append('INTERPRETATION GUIDE:')
+    if top_count >= 0.8 * n_img:
+        lines.append(f"  -> One order ('{top_order}') wins for >=80% of images.")
+        lines.append('     Claim (2) looks FALSE: a single global order is ~optimal. Just fix it.')
+    else:
+        lines.append('  -> Best order SCATTERS across images (no single order dominates).')
+        lines.append('     Claim (2) looks TRUE (confound-free): fixed order imposes a per-image ceiling.')
+    lines.append(f"  -> Mean fMSE gap = {mean_gap:.6f}. If small relative to your model's fMSE,")
+    lines.append('     the order effect is MINOR (deprioritise); if large, order is a PRIMARY lever.')
+    summary = '\n'.join(lines)
+    with open(os.path.join(args.out_dir, 'summary.txt'), 'w') as f:
+        f.write(summary + '\n')
+    print('\n' + summary)
+    print(f'\nWrote results to: {os.path.abspath(args.out_dir)}/')
+if __name__ == '__main__':
+    main()
