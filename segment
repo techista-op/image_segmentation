@@ -1,257 +1,421 @@
+"""
+filter_matrix_v2 / app.py   (2-file tool: this + index.html)
+-------------------------------------------------------------
+5x5 pixel-matrix visualizer for the 6 Harmonizer filters -- see the NUMBERS, not images.
+
+- 5x5 RGB grid, values in [0,1]. Middle 3x3 = FOREGROUND (mask=1), outer ring = BACKGROUND.
+- 6 sliders: temperature, brightness, contrast, saturation, highlight, shadow.
+- Applied in the SAME ORDER + MATH as src/model/filter.py, on the WHOLE image, then
+  composited back through the mask (FG=filtered, BG=original) -- like FilterPerformer.restore().
+- CHECKBOX "FG only": when ON, the global stats (temperature channel means, contrast mean)
+  are computed over the FOREGROUND ONLY instead of the whole image (the real code uses whole).
+
+Faithful numpy mirror of src/model/filter.py (annotated with source lines). numpy only,
+so it runs anywhere.
+
+Run:  pip install flask numpy   then   python app.py   ->  http://127.0.0.1:5000
+"""
 import os
-import sys
-import csv
-import math
-import argparse
-import itertools
-from collections import Counter
 import numpy as np
-REAL_DIR = 'real_images'
-COMP_DIR = 'composite'
-MASK_DIR = 'masks'
-OUT_DIR = 'order_oracle_out'
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(THIS_DIR, 'src', 'train', 'harmonizer', 'module'))
-import torch
-import torch.nn.functional as F
-try:
-    from PIL import Image
-except ImportError:
-    raise SystemExit('Pillow is required:  pip install pillow')
-import filter as filter_mod
-CANONICAL_FILTERS = [filter_mod.Filter.TEMPERATURE, filter_mod.Filter.BRIGHTNESS, filter_mod.Filter.CONTRAST, filter_mod.Filter.SATURATION, filter_mod.Filter.HIGHLIGHT, filter_mod.Filter.SHADOW]
-FILTER_RANGES = [0.3, 0.5, 0.5, 0.6, 0.4, 0.4]
-FILTER_NAMES = [f.name.lower() for f in CANONICAL_FILTERS]
-N_FILTERS = len(CANONICAL_FILTERS)
-def build_filter_modules(device):
-    mods = [filter_mod.FILTER_MODULES[ft]().to(device) for ft in CANONICAL_FILTERS]
-    return mods
-def apply_in_order(image, mask, args_scaled, filter_mods, order):
-    out = image
-    base = image
-    for i in order:
-        a = args_scaled[i].view(-1, 1, 1, 1)
-        filtered = filter_mods[i](out, a)
-        out = filtered * mask + base * (1 - mask)
-    return out
-def render_with_args(comp, mask, args_scaled_np, filter_mods, order, device):
-    with torch.no_grad():
-        a = torch.from_numpy(np.asarray(args_scaled_np, dtype=np.float32)).to(device)
-        args_list = [a[i].view(1) for i in range(N_FILTERS)]
-        out = apply_in_order(comp, mask, args_list, filter_mods, order)
-    return out
-def save_image(tensor, path):
-    arr = tensor.detach().clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy()
-    arr = (arr * 255.0 + 0.5).astype(np.uint8)
-    Image.fromarray(arr).save(path)
-def save_argument_image(values, names, save_path, title=None):
-    from PIL import ImageDraw, ImageFont
-    (bar_h, label_w, bar_area, pad) = (40, 130, 300, 12)
-    img_w = label_w + bar_area + pad * 2
-    title_h = 26 if title else 0
-    img_h = len(values) * (bar_h + pad) + pad + title_h
-    canvas = Image.new('RGB', (img_w, img_h), (245, 245, 245))
-    draw = ImageDraw.Draw(canvas)
-    try:
-        font = ImageFont.truetype('arial.ttf', 14)
-    except Exception:
-        font = ImageFont.load_default()
-    if title:
-        draw.text((pad, 6), title, fill=(20, 20, 20), font=font)
-    mid_x = label_w + bar_area // 2
-    for (i, (name, val)) in enumerate(zip(names, values)):
-        y0 = title_h + pad + i * (bar_h + pad)
-        y1 = y0 + bar_h
-        draw.text((pad, y0 + bar_h // 4), name, fill=(40, 40, 40), font=font)
-        draw.rectangle([label_w, y0 + 8, label_w + bar_area, y1 - 8], fill=(210, 210, 210))
-        draw.line([(mid_x, y0 + 4), (mid_x, y1 - 4)], fill=(150, 150, 150), width=1)
-        v = max(-1.0, min(1.0, float(val)))
-        bar_len = int(abs(v) * (bar_area // 2))
-        color = (80, 180, 80) if v >= 0 else (220, 70, 70)
-        if v >= 0:
-            draw.rectangle([mid_x, y0 + 8, mid_x + bar_len, y1 - 8], fill=color)
-        else:
-            draw.rectangle([mid_x - bar_len, y0 + 8, mid_x, y1 - 8], fill=color)
-        draw.text((mid_x + bar_area // 2 - 46, y0 + bar_h // 4), f'{float(val):+.4f}', fill=(40, 40, 40), font=font)
-    canvas.save(save_path)
-def fmse(pred, gt, mask):
-    diff2 = (pred - gt) ** 2
-    num = torch.sum(diff2 * mask, dim=(1, 2, 3))
-    den = torch.sum(mask, dim=(1, 2, 3)) + 1e-06
-    return torch.mean(num / den)
-def load_image(path, device):
-    img = Image.open(path).convert('RGB')
-    arr = np.asarray(img).astype(np.float32) / 255.0
-    t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-    return t.to(device)
-def load_mask(path, like, device):
-    (_, _, H, W) = like.shape
-    if path is None or not os.path.exists(path):
-        return torch.ones(1, 1, H, W, device=device)
-    m = Image.open(path).convert('L')
-    arr = np.asarray(m).astype(np.float32) / 255.0
-    t = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(device)
-    if t.shape[-2:] != (H, W):
-        t = F.interpolate(t, size=(H, W), mode='bilinear', align_corners=False)
-    return (t > 0.5).float()
-def optimise_args_for_order(comp, gt, mask, filter_mods, order, steps, lr, tol=1e-06, patience=25):
-    raw = torch.zeros(N_FILTERS, requires_grad=True, device=comp.device)
-    ranges = torch.tensor(FILTER_RANGES, device=comp.device)
-    opt = torch.optim.Adam([raw], lr=lr)
-    best = math.inf
-    best_args = None
-    stale = 0
-    used = 0
-    converged = False
-    for step in range(steps):
-        used = step + 1
-        opt.zero_grad()
-        args_unit = torch.tanh(raw)
-        args_scaled = args_unit * ranges
-        args_list = [args_scaled[i].view(1) for i in range(N_FILTERS)]
-        out = apply_in_order(comp, mask, args_list, filter_mods, order)
-        loss = fmse(out, gt, mask)
-        loss.backward()
-        opt.step()
-        v = loss.item()
-        if v < best - tol:
-            best = v
-            best_args = (torch.tanh(raw.detach()) * ranges).cpu().numpy().copy()
-            stale = 0
-        else:
-            if v < best:
-                best = v
-                best_args = (torch.tanh(raw.detach()) * ranges).cpu().numpy().copy()
-            stale += 1
-            if stale >= patience:
-                converged = True
-                break
-    return (best, best_args, used, converged)
-def get_orders(num_orders, seed=0):
-    all_perms = list(itertools.permutations(range(N_FILTERS)))
-    if num_orders is None or num_orders >= len(all_perms):
-        return all_perms
-    rng = np.random.default_rng(seed)
-    canonical = tuple(range(N_FILTERS))
-    reverse = tuple(reversed(range(N_FILTERS)))
-    chosen = {canonical, reverse}
-    while len(chosen) < num_orders:
-        chosen.add(tuple(rng.permutation(N_FILTERS)))
-    return list(chosen)
-def main():
-    ap = argparse.ArgumentParser(description='Per-order oracle fMSE sweep for the order-ceiling question.')
-    ap.add_argument('--real-dir', default=REAL_DIR)
-    ap.add_argument('--comp-dir', default=COMP_DIR)
-    ap.add_argument('--mask-dir', default=MASK_DIR)
-    ap.add_argument('--out-dir', default=OUT_DIR)
-    ap.add_argument('--num-orders', type=int, default=720, help='how many orders to try (<=720). Default 720 = exhaustive.')
-    ap.add_argument('--steps', type=int, default=300, help='max Adam steps per (image,order) -- safety cap; early-stops on convergence.')
-    ap.add_argument('--lr', type=float, default=0.05, help='Adam learning rate.')
-    ap.add_argument('--tol', type=float, default=1e-06, help='min fMSE improvement to count as progress (convergence tolerance).')
-    ap.add_argument('--patience', type=int, default=25, help="stop an order's optimisation after this many steps without > tol improvement.")
-    ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    args = ap.parse_args()
-    device = torch.device(args.device)
-    os.makedirs(args.out_dir, exist_ok=True)
-    filter_mods = build_filter_modules(device)
-    if not os.path.isdir(args.real_dir) or not os.path.isdir(args.comp_dir):
-        raise SystemExit(f"Create the folders '{args.real_dir}' and '{args.comp_dir}' and put paired images (same filenames) in them, then re-run.")
-    real_files = {f for f in os.listdir(args.real_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))}
-    comp_files = {f for f in os.listdir(args.comp_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))}
-    names = sorted(real_files & comp_files)
-    if not names:
-        raise SystemExit('No matching filenames found in real_images/ and composite/.')
-    orders = get_orders(args.num_orders)
-    print(f'Images: {len(names)} | Orders: {len(orders)} | steps={args.steps} lr={args.lr} | device={device}')
-    print(f'Total optimisations: {len(names) * len(orders)}')
-    def order_label(o):
-        return '>'.join((FILTER_NAMES[i] for i in o))
-    fmse_table = {}
-    best_args_rows = []
-    per_image_best = []
-    argmin_counter = Counter()
-    for name in names:
-        comp = load_image(os.path.join(args.comp_dir, name), device)
-        gt = load_image(os.path.join(args.real_dir, name), device)
-        if comp.shape != gt.shape:
-            gt = F.interpolate(gt, size=comp.shape[-2:], mode='bilinear', align_corners=False)
-        mask_path = os.path.join(args.mask_dir, name)
-        mask = load_mask(mask_path if os.path.isdir(args.mask_dir) else None, comp, device)
-        row = {}
-        order_args = {}
-        for (oi, order) in enumerate(orders):
-            (best, best_args, used, converged) = optimise_args_for_order(comp, gt, mask, filter_mods, order, args.steps, args.lr, tol=args.tol, patience=args.patience)
-            row[oi] = best
-            order_args[oi] = best_args
-            best_args_rows.append([name, order_label(order)] + [f'{a:.5f}' for a in best_args])
-        fmse_table[name] = row
-        best_oi = min(row, key=row.get)
-        worst_oi = max(row, key=row.get)
-        best_lbl = order_label(orders[best_oi])
-        worst_lbl = order_label(orders[worst_oi])
-        argmin_counter[best_lbl] += 1
-        per_image_best.append([name, best_lbl, f'{row[best_oi]:.6f}', f'{row[worst_oi]:.6f}', f'{row[worst_oi] - row[best_oi]:.6f}'])
-        print(f'  {name}: best={best_lbl} ({row[best_oi]:.5f})  worst={worst_lbl} ({row[worst_oi]:.5f})  gap={row[worst_oi] - row[best_oi]:.5f}')
-        stem = os.path.splitext(name)[0]
-        img_out = os.path.join(args.out_dir, 'images', stem)
-        os.makedirs(img_out, exist_ok=True)
-        save_image(gt, os.path.join(img_out, 'gt.png'))
-        save_image(comp, os.path.join(img_out, 'composite.png'))
-        best_img = render_with_args(comp, mask, order_args[best_oi], filter_mods, orders[best_oi], device)
-        worst_img = render_with_args(comp, mask, order_args[worst_oi], filter_mods, orders[worst_oi], device)
-        save_image(best_img, os.path.join(img_out, f'best__{best_lbl}__fmse{row[best_oi]:.5f}.png'))
-        save_image(worst_img, os.path.join(img_out, f'worst__{worst_lbl}__fmse{row[worst_oi]:.5f}.png'))
-        ranges_np = np.array(FILTER_RANGES, dtype=np.float32)
-        best_unit = order_args[best_oi] / ranges_np
-        worst_unit = order_args[worst_oi] / ranges_np
-        save_argument_image(best_unit, FILTER_NAMES, os.path.join(img_out, 'best_args.png'), title=f'BEST order: {best_lbl}  (fMSE {row[best_oi]:.5f})')
-        save_argument_image(worst_unit, FILTER_NAMES, os.path.join(img_out, 'worst_args.png'), title=f'WORST order: {worst_lbl}  (fMSE {row[worst_oi]:.5f})')
-    with open(os.path.join(args.out_dir, 'fmse_table.csv'), 'w', newline='') as f:
-        w = csv.writer(f)
-        w.writerow(['image'] + [order_label(o) for o in orders])
-        for name in names:
-            w.writerow([name] + [f'{fmse_table[name][oi]:.6f}' for oi in range(len(orders))])
-    with open(os.path.join(args.out_dir, 'per_image_best.csv'), 'w', newline='') as f:
-        w = csv.writer(f)
-        w.writerow(['image', 'best_order', 'best_fmse', 'worst_fmse', 'gap'])
-        w.writerows(per_image_best)
-    with open(os.path.join(args.out_dir, 'best_args.csv'), 'w', newline='') as f:
-        w = csv.writer(f)
-        w.writerow(['image', 'order'] + FILTER_NAMES)
-        w.writerows(best_args_rows)
-    n_img = len(names)
-    distinct_best = len(argmin_counter)
-    (top_order, top_count) = argmin_counter.most_common(1)[0]
-    gaps = [float(r[4]) for r in per_image_best]
-    mean_gap = sum(gaps) / len(gaps)
-    max_gap = max(gaps)
-    lines = []
-    lines.append('ORDER-CEILING ORACLE EXPERIMENT - SUMMARY')
-    lines.append('=' * 48)
-    lines.append(f'images={n_img}  orders_tried={len(orders)}  max_steps={args.steps}  lr={args.lr}  patience={args.patience}')
-    lines.append('')
-    lines.append(f'distinct best-orders across images : {distinct_best}')
-    lines.append(f'most common best-order             : {top_order}  ({top_count}/{n_img} images)')
-    lines.append(f'mean best-vs-worst fMSE gap        : {mean_gap:.6f}')
-    lines.append(f'max  best-vs-worst fMSE gap        : {max_gap:.6f}')
-    lines.append('')
-    lines.append('Top best-orders (#images : order):')
-    for (lbl, c) in argmin_counter.most_common(10):
-        lines.append(f'  {c:3d}  {lbl}')
-    lines.append('')
-    lines.append('INTERPRETATION GUIDE:')
-    if top_count >= 0.8 * n_img:
-        lines.append(f"  -> One order ('{top_order}') wins for >=80% of images.")
-        lines.append('     Claim (2) looks FALSE: a single global order is ~optimal. Just fix it.')
+from flask import Flask, request, jsonify, send_from_directory
+
+app = Flask(__name__, static_folder=os.path.dirname(os.path.abspath(__file__)))
+EPS = 1e-6
+FILTER_ORDER = ["temperature", "brightness", "contrast", "saturation", "highlight", "shadow"]
+
+
+def _mean(img, mask, fg_only, axis):
+    """fg_only=False -> plain mean (matches torch.mean in filter.py).
+       fg_only=True  -> mean over mask==1 pixels only."""
+    if not fg_only:
+        return img.mean(axis=axis, keepdims=True)
+    m = mask[..., None]
+    num = (img * m).sum(axis=axis, keepdims=True)
+    den = np.broadcast_to(m, img.shape).sum(axis=axis, keepdims=True) + EPS
+    return num / den
+
+
+def rgb_to_hsv(img):
+    r, g, b = img[..., 0], img[..., 1], img[..., 2]
+    mx = img.max(-1); mn = img.min(-1); df = mx - mn; v = mx
+    s = np.where(mx <= EPS, 0.0, df / (mx + EPS)); nz = df > EPS
+    rc = np.where((mx == r) & nz, ((g - b) / (df + EPS)) % 6, 0.0)
+    gc = np.where((mx == g) & nz, ((b - r) / (df + EPS)) + 2, 0.0)
+    bc = np.where((mx == b) & nz, ((r - g) / (df + EPS)) + 4, 0.0)
+    h = (rc + gc + bc) * (np.pi / 3.0)
+    return np.stack([h, s, v], -1)
+
+
+def hsv_to_rgb(img):
+    h, s, v = img[..., 0], img[..., 1], img[..., 2]
+    h = h / (np.pi / 3.0)
+    i = np.floor(h).astype(int) % 6; f = h - np.floor(h)
+    p = v * (1 - s); q = v * (1 - f * s); t = v * (1 - (1 - f) * s)
+    c = [i == 0, i == 1, i == 2, i == 3, i == 4, i == 5]
+    r = np.select(c, [v, q, p, p, t, v]); g = np.select(c, [t, v, v, q, p, p]); b = np.select(c, [p, p, t, v, v, q])
+    return np.stack([r, g, b], -1)
+
+
+# ---- 6 filters: numpy mirror of src/model/filter.py ----
+def f_temperature(img, x, mask, fg):                       # TemperatureFilter.forward (122-169)
+    R, G, B = img[..., 0:1], img[..., 1:2], img[..., 2:3]
+    mR = _mean(R, mask, fg, (0, 1)); mG = _mean(G, mask, fg, (0, 1)); mB = _mean(B, mask, fg, (0, 1))
+    gray = (mR + mG + mB) / 3
+    aR, aG, aB = 1 - gray / (mR + EPS), 1 - gray / (mG + EPS), 1 - gray / (mB + EPS)
+    m = abs(x)
+    mR_ = mR + (m if x < 0 else 0); mG_ = mG + (m * 0.5 if x != 0 else 0); mB_ = mB + (m if x > 0 else 0)
+    gray_ = (mR_ + mG_ + mB_) / 3
+    cR = gray_ / (mR_ + EPS) + aR; cG = gray_ / (mG_ + EPS) + aG; cB = gray_ / (mB_ + EPS) + aB
+    out = np.clip(np.concatenate([cR * R, cG * G, cB * B], -1), 0, 1)
+    sc = lambda a: float(np.asarray(a).reshape(-1)[0])
+    return out, {"meanR": sc(mR), "meanG": sc(mG), "meanB": sc(mB),
+                 "coefR": sc(cR), "coefG": sc(cG), "coefB": sc(cB)}
+
+
+def f_brightness(img, x, mask, fg):                        # BrightnessFilter.forward (15-42)
+    alpha = (1.0 / ((1 - x) + EPS)) if x >= 0 else (x + 1)
+    if x == 0.0:
+        return img.copy(), {"alpha": 1.0}                  # exact identity (no HSV round-trip drift)
+    hsv = rgb_to_hsv(img); h, s, v = hsv[..., 0:1], hsv[..., 1:2], hsv[..., 2:3]
+    v = v * alpha
+    return np.clip(hsv_to_rgb(np.concatenate([h, s, v], -1)), 0, 1), {"alpha": float(alpha)}
+
+
+def f_contrast(img, x, mask, fg):                          # ContrastFilter.forward (49-70)
+    threshold = float(np.asarray(_mean(img, mask, fg, (0, 1, 2))).reshape(-1)[0])
+    x_ = (255.0 / (256.0 - np.floor(x * 255.0)) - 1.0) if x > 0 else x
+    out = np.clip(img + (img - threshold) * x_, 0, 1)
+    return out, {"threshold": threshold, "x_": float(x_)}
+
+
+def f_saturation(img, x, mask, fg):                        # SaturationFilter.forward (79-113) -- per-pixel
+    cmin = img.min(-1, keepdims=True); cmax = img.max(-1, keepdims=True)
+    var = cmax - cmin; ran = cmax + cmin; mean = ran / 2
+    if x >= 0:
+        m = (mean < 0.5).astype(float)
+        s = (var / (ran + EPS)) * m + (var / (2 - ran + EPS)) * (1 - m)
+        mm = ((x + s) > 1).astype(float)
+        a = s * mm + (1 - x) * (1 - mm); a = 1.0 / (a + EPS) - 1.0
+        out = img + (img - mean) * a
     else:
-        lines.append('  -> Best order SCATTERS across images (no single order dominates).')
-        lines.append('     Claim (2) looks TRUE (confound-free): fixed order imposes a per-image ceiling.')
-    lines.append(f"  -> Mean fMSE gap = {mean_gap:.6f}. If small relative to your model's fMSE,")
-    lines.append('     the order effect is MINOR (deprioritise); if large, order is a PRIMARY lever.')
-    summary = '\n'.join(lines)
-    with open(os.path.join(args.out_dir, 'summary.txt'), 'w') as f:
-        f.write(summary + '\n')
-    print('\n' + summary)
-    print(f'\nWrote results to: {os.path.abspath(args.out_dir)}/')
-if __name__ == '__main__':
-    main()
+        out = mean + (img - mean) * (1 + x)
+    return np.clip(out, 0, 1), {"note": "per-pixel (HSL-style), region-independent"}
+
+
+def f_highlight(img, x, mask, fg):                         # HighlightFilter.forward (176-192)
+    g = x + 1
+    inv = np.clip(np.power((1 - img) + 1e-9, g), 0, 1)
+    return np.clip(1 - inv, 0, 1), {"gamma": float(g), "space": "inverted -> acts on brights"}
+
+
+def f_shadow(img, x, mask, fg):                            # ShadowFilter.forward (199-211)
+    g = -x + 1
+    return np.clip(np.power(img + 1e-9, g), 0, 1), {"gamma": float(g), "space": "normal -> acts on darks"}
+
+
+FILTER_FNS = {"temperature": f_temperature, "brightness": f_brightness, "contrast": f_contrast,
+              "saturation": f_saturation, "highlight": f_highlight, "shadow": f_shadow}
+
+
+def run_pipeline(img0, mask, sequence, fg_only):           # FilterPerformer.restore (module.py 59-68)
+    """sequence: list of {name, arg} applied IN THE GIVEN ORDER (the order the user moved
+    the sliders). Same masking/composite as the real code; filters can repeat."""
+    x = img0.copy(); cur = img0.copy(); steps = []
+    m3 = mask[..., None]
+    for item in sequence:
+        name = item["name"]; arg = float(item["arg"])
+        filtered, stats = FILTER_FNS[name](cur, arg, mask, fg_only)
+        cur = filtered * m3 + x * (1 - m3)                 # FG filtered, BG keeps original
+        steps.append({"name": name, "arg": arg, "stats": stats, "image": cur.round(4).tolist()})
+    final = cur.round(4).tolist()
+    return steps, final
+
+
+def default_image():
+    img = np.zeros((5, 5, 3))
+    img[:] = [0.25, 0.35, 0.75]                            # BG ring: bluish, bright
+    fg = [[0.45, 0.20, 0.15], [0.60, 0.30, 0.10], [0.75, 0.25, 0.20],
+          [0.55, 0.40, 0.15], [0.70, 0.35, 0.25], [0.50, 0.28, 0.12],
+          [0.80, 0.45, 0.30], [0.65, 0.22, 0.18], [0.58, 0.33, 0.22]]
+    k = 0
+    for i in range(1, 4):
+        for j in range(1, 4):
+            img[i, j] = fg[k]; k += 1                      # FG 3x3: warm, darker
+    return img
+
+
+def default_mask():
+    m = np.zeros((5, 5)); m[1:4, 1:4] = 1.0; return m
+
+
+@app.route("/")
+def index():
+    return send_from_directory(app.static_folder, "index.html")
+
+
+@app.route("/api/state")
+def state():
+    return jsonify({"image": default_image().round(4).tolist(),
+                    "mask": default_mask().tolist(), "order": FILTER_ORDER})
+
+
+@app.route("/api/apply", methods=["POST"])
+def apply():
+    d = request.get_json(force=True)
+    img = np.array(d["image"], dtype=float)
+    mask = np.array(d["mask"], dtype=float)
+    fg_only = bool(d.get("fg_only", False))
+    sequence = d.get("sequence", [])           # [{name, arg}, ...] in the order moved
+    steps, final = run_pipeline(img, mask, sequence, fg_only)
+    return jsonify({"steps": steps, "final": final})
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harmonizer Filter Matrix</title>
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --line:#2a2f3a; --fg:#e6e9ef; --muted:#9aa3b2; --accent:#5b9dff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 ui-monospace,Menlo,Consolas,monospace; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0 0 2px; }
+  header p { margin:0; color:var(--muted); font-size:12px; }
+  .wrap { display:flex; gap:24px; padding:20px; align-items:flex-start; flex-wrap:wrap; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  /* left: the single live matrix + history */
+  .left { flex:1; min-width:480px; }
+  table { border-collapse:collapse; }
+  td { width:92px; height:54px; border:1px solid var(--line); text-align:center; vertical-align:middle; font-size:11px; padding:2px; }
+  td.fg { outline:2px solid var(--accent); outline-offset:-2px; }
+  td .rgb { font-variant-numeric:tabular-nums; }
+  td .delta { font-size:9px; }
+  .matrix-title { font-size:13px; margin:0 0 8px; }
+  .matrix-title .tag { color:var(--muted); font-weight:400; font-size:11px; }
+  .history { margin-top:18px; }
+  .history h3 { font-size:12px; margin:0 0 6px; color:var(--muted); }
+  .seq { list-style:none; padding:0; margin:0; }
+  .seq li { font-size:11px; padding:4px 8px; border:1px solid var(--line); border-radius:6px; margin-bottom:5px; }
+  .seq li .step { color:var(--accent); }
+  .seq li .st { color:var(--muted); }
+  .seq .empty { color:var(--muted); border:none; padding:0; }
+  /* right: sliders */
+  .right { width:340px; }
+  .slider-row { margin-bottom:14px; }
+  .slider-row label { display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px; }
+  .slider-row .val { color:var(--accent); }
+  .slider-row .order { color:var(--muted); font-size:10px; }
+  input[type=range] { width:100%; }
+  .stat { color:var(--muted); font-size:11px; margin-top:2px; }
+  .check { display:flex; gap:8px; align-items:center; margin:4px 0 16px; font-size:13px;
+           background:#11151c; border:1px solid var(--line); border-radius:6px; padding:8px 10px; }
+  .check input { width:16px; height:16px; }
+  .check .hint { color:var(--muted); font-size:11px; }
+  button { background:#222733; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 10px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Harmonizer — live 5×5 filter matrix</h1>
+  <p>One 5×5 grid. Move a slider and the change is applied <b>in the order you move them</b> (e.g. temp 0.4 then shadow 0.5 → temp then shadow). Re-moving a slider updates its value in place, keeping its position in the sequence. Middle 3×3 (outlined) = foreground.</p>
+</header>
+
+<div class="wrap">
+  <div class="left panel">
+    <div class="matrix-title">Live matrix <span class="tag" id="matrixTag">— no filters applied</span></div>
+    <table id="matrix"></table>
+    <div class="history">
+      <h3>applied sequence (in order moved)</h3>
+      <ul class="seq" id="seq"><li class="empty">nothing yet — move a slider</li></ul>
+    </div>
+  </div>
+
+  <div class="right panel">
+    <label class="check">
+      <input type="checkbox" id="fgOnly">
+      <span>FG-only stats &nbsp;<span class="hint">(off = whole image, the real code)</span></span>
+    </label>
+    <div id="sliderBox"></div>
+    <button id="reset">reset all</button>
+  </div>
+</div>
+
+<script>
+const ORDER=["temperature","brightness","contrast","saturation","highlight","shadow"];
+const RANGES={temperature:0.3,brightness:0.5,contrast:0.5,saturation:0.6,highlight:0.4,shadow:0.4};
+let IMG=null, MASK=null;
+let VAL={}; ORDER.forEach(n=>VAL[n]=0);   // current slider value per filter
+let SEQ=[];                                // order filters were first moved: ["temperature","shadow",...]
+const f=v=>v.toFixed(2);
+
+function cell(rgb,orig,isFg){
+  const d=[rgb[0]-orig[0],rgb[1]-orig[1],rgb[2]-orig[2]];
+  const big=Math.max(...d.map(Math.abs));
+  const ds=big<0.001?"·":`Δ ${d.map(x=>(x>=0?'+':'')+x.toFixed(2)).join(' ')}`;
+  const bg=`rgb(${rgb.map(v=>Math.round(v*255)).join(',')})`;
+  const dark=(rgb[0]*0.3+rgb[1]*0.6+rgb[2]*0.1)>0.5;
+  return `<td class="${isFg?'fg':''}" style="background:${bg}">
+    <div class="rgb" style="color:${dark?'#000':'#fff'}">${rgb.map(f).join(' ')}</div>
+    <div class="delta" style="color:${dark?'#333':'#bbb'}">${ds}</div></td>`;
+}
+function drawMatrix(img){
+  let h=""; for(let i=0;i<5;i++){h+="<tr>";for(let j=0;j<5;j++)h+=cell(img[i][j],IMG[i][j],MASK[i][j]===1);h+="</tr>";}
+  document.getElementById('matrix').innerHTML=h;
+}
+function statLine(n,s){
+  if(n==="temperature")return `meanRGB=[${s.meanR.toFixed(3)}, ${s.meanG.toFixed(3)}, ${s.meanB.toFixed(3)}]  coef=[${s.coefR.toFixed(3)}, ${s.coefG.toFixed(3)}, ${s.coefB.toFixed(3)}]`;
+  if(n==="brightness")return `alpha = ${s.alpha.toFixed(3)}`;
+  if(n==="contrast")return `threshold = ${s.threshold.toFixed(3)}, x_ = ${s.x_.toFixed(3)}`;
+  if(n==="saturation")return s.note;
+  if(n==="highlight"||n==="shadow")return `gamma = ${s.gamma.toFixed(3)} (${s.space})`;
+  return "";
+}
+// sequence sent to backend = SEQ order, each with its current value (skip zeros)
+function buildSequence(){ return SEQ.filter(n=>VAL[n]!==0).map(n=>({name:n,arg:VAL[n]})); }
+
+async function apply(){
+  const fg_only=document.getElementById('fgOnly').checked;
+  const sequence=buildSequence();
+  const r=await fetch('/api/apply',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({image:IMG,mask:MASK,sequence,fg_only})});
+  const data=await r.json();
+  const finalImg = data.steps.length ? data.steps[data.steps.length-1].image : IMG;
+  drawMatrix(finalImg);
+  // tag + history
+  document.getElementById('matrixTag').textContent = sequence.length
+    ? "— after: " + sequence.map(s=>`${s.name}(${s.arg.toFixed(2)})`).join(" → ")
+    : "— no filters applied";
+  const seqEl=document.getElementById('seq');
+  if(!data.steps.length){ seqEl.innerHTML='<li class="empty">nothing yet — move a slider</li>'; return; }
+  seqEl.innerHTML = data.steps.map((s,i)=>
+    `<li><span class="step">${i+1}. ${s.name} = ${s.arg.toFixed(2)}</span><br><span class="st">${statLine(s.name,s.stats)}</span></li>`).join("");
+  // refresh the order badges on sliders
+  ORDER.forEach(n=>{
+    const idx=sequence.findIndex(s=>s.name===n);
+    document.getElementById('o_'+n).textContent = idx>=0 ? `step ${idx+1}` : "";
+  });
+}
+
+function onSlide(n,v){
+  VAL[n]=v;
+  document.getElementById('v_'+n).textContent=v.toFixed(2);
+  // first time this filter is moved to a non-zero value -> append to sequence (update in place otherwise)
+  if(v!==0 && !SEQ.includes(n)) SEQ.push(n);
+  if(v===0 && SEQ.includes(n)) SEQ=SEQ.filter(x=>x!==n);  // back to 0 removes it from the chain
+  apply();
+}
+function sliders(){
+  const box=document.getElementById('sliderBox'); box.innerHTML="";
+  ORDER.forEach(n=>{
+    const row=document.createElement('div'); row.className='slider-row';
+    row.innerHTML=`<label>${n} <span><span class="order" id="o_${n}"></span> <span class="val" id="v_${n}">0.00</span></span></label>
+      <input type="range" id="s_${n}" min="-1" max="1" step="0.02" value="0">
+      <div class="stat">train range ±${RANGES[n]}</div>`;
+    box.appendChild(row);
+    row.querySelector('input').addEventListener('input',e=>onSlide(n,parseFloat(e.target.value)));
+  });
+}
+document.getElementById('reset').addEventListener('click',()=>{
+  ORDER.forEach(n=>{VAL[n]=0;document.getElementById('s_'+n).value=0;document.getElementById('v_'+n).textContent="0.00";document.getElementById('o_'+n).textContent="";});
+  SEQ=[]; apply();
+});
+document.getElementById('fgOnly').addEventListener('change',apply);
+(async function(){
+  const d=await (await fetch('/api/state')).json(); IMG=d.image; MASK=d.mask;
+  drawMatrix(IMG); sliders(); apply();
+})();
+</script>
+</body>
+</html>
+
+
+# Harmonizer — Handoff Notes
+
+Image harmonization: paste a foreground (FG) into a background (BG), predict 6 filter
+arguments, apply them to make the FG match the scene. Self-supervised — degrade a real
+image to make a training composite, then learn to restore it.
+
+## The 6 filters — `src/model/filter.py`
+
+Each filter takes `image [n,3,h,w]` in `[0,1]` and a scalar arg `x ∈ [-1,1]`, returns a
+clamped image. Two kinds: **global** (use whole-image stats) and **per-pixel**.
+
+| # | Filter | Mechanism | Global stat? |
+|---|--------|-----------|--------------|
+| 1 | temperature | gray-world: scale R/G/B by coefs from channel means; +x warms (R up), -x cools (B up), G half | **yes** (channel means) |
+| 2 | brightness  | HSV, scale V by alpha. +x: `1/(1-x)` (steep); -x: `x+1` (linear) | no |
+| 3 | contrast    | push each pixel away from image mean: `img+(img-mean)*x_`; +x steep remap | **yes** (global mean) |
+| 4 | saturation  | spread channels around per-pixel HSL lightness; boost is ceiling-aware | no |
+| 5 | highlight   | gamma `^(x+1)` in inverted space → acts on brights | no |
+| 6 | shadow      | gamma `^(1-x)` on normal image → acts on darks | no |
+
+Key subtlety (temperature/contrast): stats are taken over the **whole image incl. BG**,
+then the result is masked to FG. The BG steers the FG correction — intended for harmonization.
+Direction note: temperature's labels (`is_negative`=warm) are inverted vs the actual visual
+effect because the shifted mean sits in the coef denominator — verified numerically.
+
+## Apply order & masking — `src/model/module.py` (`FilterPerformer`)
+
+- Forward order (restore): `temperature → brightness → contrast → saturation → highlight → shadow`.
+- `restore()` chains filters on the running image; after each, composites `out*mask + x*(1-mask)`
+  (FG filtered, BG = original). Returns the cumulative output after **every** filter (6 images).
+- `adjust()` = inverse: runs filters in **reversed** order to degrade a real image into a composite.
+
+## Argument prediction — `src/model/harmonizer.py`
+
+Backbone EfficientNet-B0 on FG/BG streams → regressor emits all 6 args **jointly** from the
+composite. Args clamped to `[-1,1]`. Train-time degrade args scaled by `filter_argument_ranges`
+= `[0.3, 0.5, 0.5, 0.6, 0.4, 0.4]`.
+
+## Training pipeline — `src/train/harmonizer/`
+
+- `data.py`: dataset returns `(composite, mask), (real,)`. No filtering here (done in model).
+- `trainer.py::_batch_prehandle` (lines ~566–585): the self-supervised core.
+  `adjust(real, mask, rand_args)` degrades real → composite and returns **all intermediates**.
+  `gt` is built as the reversed degradation states + real image → a per-stage target list
+  `G5…G0` aligned to the restore forward order. **The intermediates are already saved.**
+- `criterion.py::HarmonizerLoss`: per stage, FG-masked `L1 + 10*L2` (L1 = smooth abs).
+  Zips `pred_outputs` (6 cumulative) with `gt` (6 targets) → list of 6 stage losses.
+
+## Loss branches (this is multi-branch experiment territory)
+
+- **This branch (MLP / joint, Approach #1):** `trainer.py` lines 113–118 use **only the final
+  stage**: `fine_loss = mean(l_image_losses[-1])`. The other 5 stage losses are computed but
+  logged as diagnostics only (`raw_filter_*`, `fine_filter_*` meters, no gradient).
+  Rationale in comment: with joint prediction, per-stage targets conflict with jointly-optimal
+  args, so they fell back to final-only.
+- **Other branches:** differ mainly in the **regressor head** (Cascade / SingleHead /
+  AttnHeadRegressor — see commented lines in train `harmonizer.py`) and the per-stage-vs-final
+  loss toggle. Filter math + degrade→restore pipeline stay constant across branches.
+
+## Per-stage loss discussion (open thread)
+
+Naive `|θ̂-θ|` argument MSE is wrong: args aren't comparable units, filters don't commute,
+forward ≠ exact inverse (clamping is lossy), and stateful filters depend on the image's stats.
+The right form is **image-space per-stage**: `Σ_k w_k ‖ r_k − G_k ‖₁` against saved `G_k`.
+That machinery already exists (just disabled here). Genuinely *new* relative to the repo would
+be: (a) teacher forcing / scheduled sampling, or (b) a small teacher-forced term for the
+**stateful filters only** (temp, contrast) so their means/variance are supervised on the correct
+image — the one thing both free-rollout and final-only loss get wrong. Caveat: clipped pixels
+(exactly 0/1 in target) give an irreducible loss floor — mask them out.
+
+## Inspection tool — `filter_matrix_v2/` (app.py + index.html)
+
+Run: `pip install flask numpy && python app.py` → http://127.0.0.1:5000
+Single live 5×5 matrix (middle 3×3 = FG). Sliders on the right; filters apply **in the order
+you move them**; re-sliding updates in place. Shows per-step internal stats (temp means/coefs,
+contrast threshold, brightness alpha, gammas) + a sequence/history panel. Checkbox toggles
+whole-image vs FG-only stats. numpy mirror of `filter.py` (annotated), runs without torch.
+
+## Pointers
+
+- Filter math: `src/model/filter.py`
+- Apply/compose: `src/model/module.py`
+- Predict: `src/model/harmonizer.py` (infer) / `src/train/harmonizer/module/harmonizer.py` (train)
+- Loss: `src/train/harmonizer/criterion.py` + `trainer.py` (lines 113–149 = what's active)
+- Data/degrade: `src/train/harmonizer/trainer.py::_batch_prehandle`
