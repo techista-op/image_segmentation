@@ -1,421 +1,1657 @@
+dmeo inverse 
+
 """
-filter_matrix_v2 / app.py   (2-file tool: this + index.html)
--------------------------------------------------------------
-5x5 pixel-matrix visualizer for the 6 Harmonizer filters -- see the NUMBERS, not images.
+demo_inverse_on_sample.py
+=========================
+Demonstrates the closed-form inverse-argument idea on the real sample image
+(sample/image.jpg + sample/mask.png), branch loss_function.
 
-- 5x5 RGB grid, values in [0,1]. Middle 3x3 = FOREGROUND (mask=1), outer ring = BACKGROUND.
-- 6 sliders: temperature, brightness, contrast, saturation, highlight, shadow.
-- Applied in the SAME ORDER + MATH as src/model/filter.py, on the WHOLE image, then
-  composited back through the mask (FG=filtered, BG=original) -- like FilterPerformer.restore().
-- CHECKBOX "FG only": when ON, the global stats (temperature channel means, contrast mean)
-  are computed over the FOREGROUND ONLY instead of the whole image (the real code uses whole).
+Pipeline (mirrors the training degrade->restore, but with KNOWN args):
+  1. load image + mask (FG = white in mask)
+  2. for each of the 6 filters, pick a random degrade arg x
+  3. degrade: apply filter(x) to the FG region only (composite with original BG)
+  4. compute closed-form recovery arg y = inverse(x[, stats])
+  5. restore: apply filter(y) to the degraded image (FG region)
+  6. measure how well restore matches the original FG (excl. clamped pixels)
+  7. save a side-by-side panel and a JSON of {x, y, errors} per filter
 
-Faithful numpy mirror of src/model/filter.py (annotated with source lines). numpy only,
-so it runs anywhere.
-
-Run:  pip install flask numpy   then   python app.py   ->  http://127.0.0.1:5000
+Pure numpy replica of module/filter.py math (whole-image stats, paper conv.).
+Runs on CPU in well under a second.
 """
-import os
+import os, json
 import numpy as np
-from flask import Flask, request, jsonify, send_from_directory
+from PIL import Image
 
-app = Flask(__name__, static_folder=os.path.dirname(os.path.abspath(__file__)))
+from inverse_targets import compute_inverse_arg
+
 EPS = 1e-6
-FILTER_ORDER = ["temperature", "brightness", "contrast", "saturation", "highlight", "shadow"]
+HERE = os.path.dirname(os.path.abspath(__file__))
+SAMPLE = os.path.join(HERE, 'sample')
+OUT = os.path.join(SAMPLE, 'inverse_demo')
+os.makedirs(OUT, exist_ok=True)
+np.random.seed(7)
 
-
-def _mean(img, mask, fg_only, axis):
-    """fg_only=False -> plain mean (matches torch.mean in filter.py).
-       fg_only=True  -> mean over mask==1 pixels only."""
-    if not fg_only:
-        return img.mean(axis=axis, keepdims=True)
-    m = mask[..., None]
-    num = (img * m).sum(axis=axis, keepdims=True)
-    den = np.broadcast_to(m, img.shape).sum(axis=axis, keepdims=True) + EPS
-    return num / den
-
-
+# ---------------- filter.py replicas (whole-image stats) ----------------
 def rgb_to_hsv(img):
-    r, g, b = img[..., 0], img[..., 1], img[..., 2]
-    mx = img.max(-1); mn = img.min(-1); df = mx - mn; v = mx
-    s = np.where(mx <= EPS, 0.0, df / (mx + EPS)); nz = df > EPS
-    rc = np.where((mx == r) & nz, ((g - b) / (df + EPS)) % 6, 0.0)
-    gc = np.where((mx == g) & nz, ((b - r) / (df + EPS)) + 2, 0.0)
-    bc = np.where((mx == b) & nz, ((r - g) / (df + EPS)) + 4, 0.0)
-    h = (rc + gc + bc) * (np.pi / 3.0)
-    return np.stack([h, s, v], -1)
-
-
+    r,g,b=img[0],img[1],img[2]
+    maxc=np.max(img,axis=0); minc=np.min(img,axis=0); v=maxc; d=maxc-minc
+    s=np.where(maxc>0,d/(maxc+EPS),0.0); ds=np.where(d==0,1.0,d)
+    rc=(maxc-r)/ds; gc=(maxc-g)/ds; bc=(maxc-b)/ds; h=np.zeros_like(maxc)
+    h=np.where(maxc==r,bc-gc,h); h=np.where(maxc==g,2.0+rc-bc,h); h=np.where(maxc==b,4.0+gc-rc,h)
+    h=(h/6.0)%1.0; h=np.where(d==0,0.0,h); return np.stack([h*2*np.pi,s,v],axis=0)
 def hsv_to_rgb(img):
-    h, s, v = img[..., 0], img[..., 1], img[..., 2]
-    h = h / (np.pi / 3.0)
-    i = np.floor(h).astype(int) % 6; f = h - np.floor(h)
-    p = v * (1 - s); q = v * (1 - f * s); t = v * (1 - (1 - f) * s)
-    c = [i == 0, i == 1, i == 2, i == 3, i == 4, i == 5]
-    r = np.select(c, [v, q, p, p, t, v]); g = np.select(c, [t, v, v, q, p, p]); b = np.select(c, [p, p, t, v, v, q])
-    return np.stack([r, g, b], -1)
+    h=img[0]/(2*np.pi); s=img[1]; v=img[2]; h6=(h%1.0)*6.0; i=np.floor(h6).astype(int); f=h6-i
+    p=v*(1-s); q=v*(1-s*f); t=v*(1-s*(1-f)); i=i%6
+    r=np.choose(i,[v,q,p,p,t,v]); g=np.choose(i,[t,v,v,q,p,p]); b=np.choose(i,[p,p,t,v,v,q]); return np.stack([r,g,b],axis=0)
+def cl(x): return np.clip(x,0.0,1.0)
 
+def f_temperature(img,x):
+    R,G,B=img[0:1],img[1:2],img[2:3]
+    mR,mG,mB=R.mean(),G.mean(),B.mean(); gray=(mR+mG+mB)/3
+    aR=1-gray/(mR+EPS); aG=1-gray/(mG+EPS); aB=1-gray/(mB+EPS)
+    ip=1.0 if x>0 else 0.0; ineg=1.0 if x<0 else 0.0; iz=1.0 if x==0 else 0.0
+    mR_=mR+x*np.sign(x)*ineg; mG_=mG+x*np.sign(x)*0.5*(1-iz); mB_=mB+x*np.sign(x)*ip
+    gray_=(mR_+mG_+mB_)/3
+    cR=gray_/(mR_+EPS)+aR; cG=gray_/(mG_+EPS)+aG; cB=gray_/(mB_+EPS)+aB
+    return cl(np.concatenate([cR*R,cG*G,cB*B],axis=0))
+def f_brightness(img,x):
+    hsv=rgb_to_hsv(img); h,s,v=hsv[0:1],hsv[1:2],hsv[2:3]
+    a=(1/((1-x)+EPS)) if x>=0 else (x+1); v=v*a
+    return cl(hsv_to_rgb(np.concatenate([h,s,v],axis=0)))
+def f_contrast(img,x):
+    th=img.mean(); x_=255/(256-np.floor(x*255))-1 if x>0 else x; return cl(img+(img-th)*x_)
+def f_saturation(img,x):
+    cmin=img.min(0,keepdims=True); cmax=img.max(0,keepdims=True); var=cmax-cmin; ran=cmax+cmin; mean=ran/2
+    if x>=0:
+        m=(mean<0.5).astype(float); s=(var/(ran+EPS))*m+(var/(2-ran+EPS))*(1-m)
+        mm=((x+s)>1).astype(float); a=s*mm+(1-x)*(1-mm); a=1/(a+EPS)-1; return cl(img+(img-mean)*a)
+    return cl(mean+(img-mean)*(1+x))
+def f_highlight(img,x): return cl(1.0-cl(np.power(1.0-img+1e-9,x+1)))
+def f_shadow(img,x): return cl(np.power(img+1e-9,-x+1))
 
-# ---- 6 filters: numpy mirror of src/model/filter.py ----
-def f_temperature(img, x, mask, fg):                       # TemperatureFilter.forward (122-169)
-    R, G, B = img[..., 0:1], img[..., 1:2], img[..., 2:3]
-    mR = _mean(R, mask, fg, (0, 1)); mG = _mean(G, mask, fg, (0, 1)); mB = _mean(B, mask, fg, (0, 1))
-    gray = (mR + mG + mB) / 3
-    aR, aG, aB = 1 - gray / (mR + EPS), 1 - gray / (mG + EPS), 1 - gray / (mB + EPS)
-    m = abs(x)
-    mR_ = mR + (m if x < 0 else 0); mG_ = mG + (m * 0.5 if x != 0 else 0); mB_ = mB + (m if x > 0 else 0)
-    gray_ = (mR_ + mG_ + mB_) / 3
-    cR = gray_ / (mR_ + EPS) + aR; cG = gray_ / (mG_ + EPS) + aG; cB = gray_ / (mB_ + EPS) + aB
-    out = np.clip(np.concatenate([cR * R, cG * G, cB * B], -1), 0, 1)
-    sc = lambda a: float(np.asarray(a).reshape(-1)[0])
-    return out, {"meanR": sc(mR), "meanG": sc(mG), "meanB": sc(mB),
-                 "coefR": sc(cR), "coefG": sc(cG), "coefB": sc(cB)}
-
-
-def f_brightness(img, x, mask, fg):                        # BrightnessFilter.forward (15-42)
-    alpha = (1.0 / ((1 - x) + EPS)) if x >= 0 else (x + 1)
-    if x == 0.0:
-        return img.copy(), {"alpha": 1.0}                  # exact identity (no HSV round-trip drift)
-    hsv = rgb_to_hsv(img); h, s, v = hsv[..., 0:1], hsv[..., 1:2], hsv[..., 2:3]
-    v = v * alpha
-    return np.clip(hsv_to_rgb(np.concatenate([h, s, v], -1)), 0, 1), {"alpha": float(alpha)}
-
-
-def f_contrast(img, x, mask, fg):                          # ContrastFilter.forward (49-70)
-    threshold = float(np.asarray(_mean(img, mask, fg, (0, 1, 2))).reshape(-1)[0])
-    x_ = (255.0 / (256.0 - np.floor(x * 255.0)) - 1.0) if x > 0 else x
-    out = np.clip(img + (img - threshold) * x_, 0, 1)
-    return out, {"threshold": threshold, "x_": float(x_)}
-
-
-def f_saturation(img, x, mask, fg):                        # SaturationFilter.forward (79-113) -- per-pixel
-    cmin = img.min(-1, keepdims=True); cmax = img.max(-1, keepdims=True)
-    var = cmax - cmin; ran = cmax + cmin; mean = ran / 2
-    if x >= 0:
-        m = (mean < 0.5).astype(float)
-        s = (var / (ran + EPS)) * m + (var / (2 - ran + EPS)) * (1 - m)
-        mm = ((x + s) > 1).astype(float)
-        a = s * mm + (1 - x) * (1 - mm); a = 1.0 / (a + EPS) - 1.0
-        out = img + (img - mean) * a
-    else:
-        out = mean + (img - mean) * (1 + x)
-    return np.clip(out, 0, 1), {"note": "per-pixel (HSL-style), region-independent"}
-
-
-def f_highlight(img, x, mask, fg):                         # HighlightFilter.forward (176-192)
-    g = x + 1
-    inv = np.clip(np.power((1 - img) + 1e-9, g), 0, 1)
-    return np.clip(1 - inv, 0, 1), {"gamma": float(g), "space": "inverted -> acts on brights"}
-
-
-def f_shadow(img, x, mask, fg):                            # ShadowFilter.forward (199-211)
-    g = -x + 1
-    return np.clip(np.power(img + 1e-9, g), 0, 1), {"gamma": float(g), "space": "normal -> acts on darks"}
-
-
-FILTER_FNS = {"temperature": f_temperature, "brightness": f_brightness, "contrast": f_contrast,
-              "saturation": f_saturation, "highlight": f_highlight, "shadow": f_shadow}
-
-
-def run_pipeline(img0, mask, sequence, fg_only):           # FilterPerformer.restore (module.py 59-68)
-    """sequence: list of {name, arg} applied IN THE GIVEN ORDER (the order the user moved
-    the sliders). Same masking/composite as the real code; filters can repeat."""
-    x = img0.copy(); cur = img0.copy(); steps = []
-    m3 = mask[..., None]
-    for item in sequence:
-        name = item["name"]; arg = float(item["arg"])
-        filtered, stats = FILTER_FNS[name](cur, arg, mask, fg_only)
-        cur = filtered * m3 + x * (1 - m3)                 # FG filtered, BG keeps original
-        steps.append({"name": name, "arg": arg, "stats": stats, "image": cur.round(4).tolist()})
-    final = cur.round(4).tolist()
-    return steps, final
-
-
-def default_image():
-    img = np.zeros((5, 5, 3))
-    img[:] = [0.25, 0.35, 0.75]                            # BG ring: bluish, bright
-    fg = [[0.45, 0.20, 0.15], [0.60, 0.30, 0.10], [0.75, 0.25, 0.20],
-          [0.55, 0.40, 0.15], [0.70, 0.35, 0.25], [0.50, 0.28, 0.12],
-          [0.80, 0.45, 0.30], [0.65, 0.22, 0.18], [0.58, 0.33, 0.22]]
-    k = 0
-    for i in range(1, 4):
-        for j in range(1, 4):
-            img[i, j] = fg[k]; k += 1                      # FG 3x3: warm, darker
-    return img
-
-
-def default_mask():
-    m = np.zeros((5, 5)); m[1:4, 1:4] = 1.0; return m
-
-
-@app.route("/")
-def index():
-    return send_from_directory(app.static_folder, "index.html")
-
-
-@app.route("/api/state")
-def state():
-    return jsonify({"image": default_image().round(4).tolist(),
-                    "mask": default_mask().tolist(), "order": FILTER_ORDER})
-
-
-@app.route("/api/apply", methods=["POST"])
-def apply():
-    d = request.get_json(force=True)
-    img = np.array(d["image"], dtype=float)
-    mask = np.array(d["mask"], dtype=float)
-    fg_only = bool(d.get("fg_only", False))
-    sequence = d.get("sequence", [])           # [{name, arg}, ...] in the order moved
-    steps, final = run_pipeline(img, mask, sequence, fg_only)
-    return jsonify({"steps": steps, "final": final})
-
-
-if __name__ == "__main__":
-    app.run(debug=True, port=5000)
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Harmonizer Filter Matrix</title>
-<style>
-  :root { --bg:#0f1115; --panel:#181b22; --line:#2a2f3a; --fg:#e6e9ef; --muted:#9aa3b2; --accent:#5b9dff; }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 ui-monospace,Menlo,Consolas,monospace; }
-  header { padding:14px 20px; border-bottom:1px solid var(--line); }
-  header h1 { font-size:16px; margin:0 0 2px; }
-  header p { margin:0; color:var(--muted); font-size:12px; }
-  .wrap { display:flex; gap:24px; padding:20px; align-items:flex-start; flex-wrap:wrap; }
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
-  /* left: the single live matrix + history */
-  .left { flex:1; min-width:480px; }
-  table { border-collapse:collapse; }
-  td { width:92px; height:54px; border:1px solid var(--line); text-align:center; vertical-align:middle; font-size:11px; padding:2px; }
-  td.fg { outline:2px solid var(--accent); outline-offset:-2px; }
-  td .rgb { font-variant-numeric:tabular-nums; }
-  td .delta { font-size:9px; }
-  .matrix-title { font-size:13px; margin:0 0 8px; }
-  .matrix-title .tag { color:var(--muted); font-weight:400; font-size:11px; }
-  .history { margin-top:18px; }
-  .history h3 { font-size:12px; margin:0 0 6px; color:var(--muted); }
-  .seq { list-style:none; padding:0; margin:0; }
-  .seq li { font-size:11px; padding:4px 8px; border:1px solid var(--line); border-radius:6px; margin-bottom:5px; }
-  .seq li .step { color:var(--accent); }
-  .seq li .st { color:var(--muted); }
-  .seq .empty { color:var(--muted); border:none; padding:0; }
-  /* right: sliders */
-  .right { width:340px; }
-  .slider-row { margin-bottom:14px; }
-  .slider-row label { display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px; }
-  .slider-row .val { color:var(--accent); }
-  .slider-row .order { color:var(--muted); font-size:10px; }
-  input[type=range] { width:100%; }
-  .stat { color:var(--muted); font-size:11px; margin-top:2px; }
-  .check { display:flex; gap:8px; align-items:center; margin:4px 0 16px; font-size:13px;
-           background:#11151c; border:1px solid var(--line); border-radius:6px; padding:8px 10px; }
-  .check input { width:16px; height:16px; }
-  .check .hint { color:var(--muted); font-size:11px; }
-  button { background:#222733; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 10px; cursor:pointer; font:inherit; }
-  button:hover { border-color:var(--accent); }
-</style>
-</head>
-<body>
-<header>
-  <h1>Harmonizer — live 5×5 filter matrix</h1>
-  <p>One 5×5 grid. Move a slider and the change is applied <b>in the order you move them</b> (e.g. temp 0.4 then shadow 0.5 → temp then shadow). Re-moving a slider updates its value in place, keeping its position in the sequence. Middle 3×3 (outlined) = foreground.</p>
-</header>
-
-<div class="wrap">
-  <div class="left panel">
-    <div class="matrix-title">Live matrix <span class="tag" id="matrixTag">— no filters applied</span></div>
-    <table id="matrix"></table>
-    <div class="history">
-      <h3>applied sequence (in order moved)</h3>
-      <ul class="seq" id="seq"><li class="empty">nothing yet — move a slider</li></ul>
-    </div>
-  </div>
-
-  <div class="right panel">
-    <label class="check">
-      <input type="checkbox" id="fgOnly">
-      <span>FG-only stats &nbsp;<span class="hint">(off = whole image, the real code)</span></span>
-    </label>
-    <div id="sliderBox"></div>
-    <button id="reset">reset all</button>
-  </div>
-</div>
-
-<script>
-const ORDER=["temperature","brightness","contrast","saturation","highlight","shadow"];
-const RANGES={temperature:0.3,brightness:0.5,contrast:0.5,saturation:0.6,highlight:0.4,shadow:0.4};
-let IMG=null, MASK=null;
-let VAL={}; ORDER.forEach(n=>VAL[n]=0);   // current slider value per filter
-let SEQ=[];                                // order filters were first moved: ["temperature","shadow",...]
-const f=v=>v.toFixed(2);
-
-function cell(rgb,orig,isFg){
-  const d=[rgb[0]-orig[0],rgb[1]-orig[1],rgb[2]-orig[2]];
-  const big=Math.max(...d.map(Math.abs));
-  const ds=big<0.001?"·":`Δ ${d.map(x=>(x>=0?'+':'')+x.toFixed(2)).join(' ')}`;
-  const bg=`rgb(${rgb.map(v=>Math.round(v*255)).join(',')})`;
-  const dark=(rgb[0]*0.3+rgb[1]*0.6+rgb[2]*0.1)>0.5;
-  return `<td class="${isFg?'fg':''}" style="background:${bg}">
-    <div class="rgb" style="color:${dark?'#000':'#fff'}">${rgb.map(f).join(' ')}</div>
-    <div class="delta" style="color:${dark?'#333':'#bbb'}">${ds}</div></td>`;
+FILTERS = {
+    'temperature': f_temperature, 'brightness': f_brightness, 'contrast': f_contrast,
+    'saturation': f_saturation, 'highlight': f_highlight, 'shadow': f_shadow,
 }
-function drawMatrix(img){
-  let h=""; for(let i=0;i<5;i++){h+="<tr>";for(let j=0;j<5;j++)h+=cell(img[i][j],IMG[i][j],MASK[i][j]===1);h+="</tr>";}
-  document.getElementById('matrix').innerHTML=h;
+# paper degrade ranges (Harmonizer.filter_argument_ranges)
+RANGES = {'temperature':0.3,'brightness':0.5,'contrast':0.5,'saturation':0.6,'highlight':0.4,'shadow':0.4}
+
+def composite(filt, orig, mask): return filt*mask + orig*(1-mask)
+
+def load():
+    img = Image.open(os.path.join(SAMPLE,'image.jpg')).convert('RGB')
+    mask = Image.open(os.path.join(SAMPLE,'mask.png')).convert('L').resize(img.size)
+    a = np.asarray(img, np.float64).transpose(2,0,1)/255.0
+    m = (np.asarray(mask, np.float64)/255.0)[None,:,:]
+    m = (m>0.5).astype(np.float64)
+    return a, m
+
+def to_uint8(a): return (cl(a)*255).astype(np.uint8).transpose(1,2,0)
+
+def main():
+    img, mask = load()
+    fg_px = mask.sum()*3
+    print(f"image {img.shape}  FG fraction = {mask.mean():.3f}")
+    results = {}
+    panels = []
+    for name, f in FILTERS.items():
+        x = float(np.random.uniform(-1,1) * RANGES[name])   # degrade arg (scaled like training)
+        # degrade FG only
+        degraded = composite(f(img, x), img, mask)
+        # closed-form recovery arg (needs image for temperature stats)
+        y = compute_inverse_arg(name, x, image=degraded)
+        # restore FG only
+        restored = composite(f(degraded, y), degraded, mask)
+        # error on FG, excluding clamped pixels
+        mask3 = np.repeat(mask, 3, axis=0)
+        clipped = (degraded<=0.0)|(degraded>=1.0)
+        fgsel = (mask3>0.5) & (~clipped)
+        n = fgsel.sum()
+        err_fg = np.abs(restored-img)[fgsel].mean() if n else 0.0
+        # baseline: error if we did NOTHING (degraded vs original) on FG
+        err_none = np.abs(degraded-img)[mask3>0.5].mean()
+        results[name] = {
+            'degrade_x': round(x,5),
+            'recovery_y': round(float(y),5),
+            'fg_recover_err_unclipped': round(float(err_fg),6),
+            'fg_degrade_err': round(float(err_none),6),
+            'improvement_x': round(float(err_none/(err_fg+1e-9)),2),
+        }
+        panels.append((name, img, degraded, restored))
+        print(f"  {name:11s} x={x:+.3f} -> y={y:+.3f} | degrade_err={err_none:.4f}  "
+              f"recover_err={err_fg:.5f}  ({err_none/(err_fg+1e-9):.0f}x better)")
+
+    # save per-filter triptychs (orig | degraded | restored)
+    for name, o, d, r in panels:
+        strip = np.concatenate([to_uint8(o), to_uint8(d), to_uint8(r)], axis=1)
+        Image.fromarray(strip).save(os.path.join(OUT, f'{name}.png'))
+
+    # one big montage: rows = filters, cols = orig|degraded|restored
+    rows = [np.concatenate([to_uint8(o),to_uint8(d),to_uint8(r)],axis=1) for _,o,d,r in panels]
+    montage = np.concatenate(rows, axis=0)
+    Image.fromarray(montage).save(os.path.join(OUT,'montage_all_filters.png'))
+
+    with open(os.path.join(OUT,'inverse_results.json'),'w') as fjson:
+        json.dump(results, fjson, indent=2)
+    print(f"\nSaved -> {OUT}")
+    print("  montage_all_filters.png, <filter>.png, inverse_results.json")
+
+if __name__ == '__main__':
+    main()
+
+# context.md — Inverse-Argument Loss: Full Context, Code, and Integration Plan
+
+**Branch:** `loss_function`
+**Status:** Idea validated; tooling built and run on real data; training integration **not yet wired**.
+**This file consolidates everything in one place:** the investigation, the two scripts (`inverse_targets.py`, `demo_inverse_on_sample.py`) explained, the three ways to turn it into a loss, and exactly which files/lines to change to wire it into the MLP/joint pipeline.
+
+---
+
+## Table of contents
+1. The problem and the idea
+2. The inverse, stated precisely
+3. Per-filter inverse derivations
+4. The central finding: the only error is clamping
+5. Verification methodology & results on the sample image
+6. Code walkthrough — `inverse_targets.py`
+7. Code walkthrough — `demo_inverse_on_sample.py`
+8. Three approaches to use it as a loss
+9. **Integration: which files to change and where** (the MLP/loss_function pipeline)
+10. Caveats and sequencing
+
+---
+
+## 1. The problem and the idea
+
+Harmonizer is trained self-supervised. A real (clean) image is *degraded* into a synthetic composite by applying a known scalar argument to each of the 6 filters, in reverse order, on the foreground (FG) region only:
+
+```
+real image
+  apply para_6 (FG) -> comp_6
+  apply para_5 (FG) -> comp_5
+  apply para_4 (FG) -> comp_4
+  apply para_3 (FG) -> comp_3
+  apply para_2 (FG) -> comp_2
+  apply para_1 (FG) -> comp_1     <- the model sees ONLY this
+```
+
+The model sees `comp_1` and must predict 6 arguments that restore it toward the real image. Each predicted argument is the model's attempt to **invert** one filter, judged only from the final composite.
+
+**Why the original per-stage loss does not transfer to the MLP head.**
+In the **cascade** regressor, arguments are predicted *in order* (head `i` conditioned on previous heads), so each intermediate stage has a well-defined target (`comp_2 … comp_6`) and the paper's dynamic per-stage loss is meaningful. In the **MLP / joint / order-invariant** head, all 6 arguments come out at once — there is no "after filter `i`" hidden state aligned to `comp_{i+1}`, so image-space per-stage supervision is inconsistent with how the prediction is formed. That is why the MLP branch supervises only the **final** image (`fine_loss = mean(l_image_losses[-1])`) and logs the other 5 stages as diagnostics. The cost: **middle filters stay inert** — nothing gives each filter its own gradient.
+
+**The idea.** Because **we generate the degrade ourselves**, we know each `para_i` and we have every intermediate image. So for each filter we can compute the exact **recovery argument** `y_i` (the value that undoes the degrade) and supervise the prediction directly in **argument space**:
+
+```
+loss_i = MAE( y_hat_i , y_true_i )
+```
+
+`y_true_i` is fixed when the degrade is generated and **does not depend on prediction order** — exactly what sidesteps the failure of image-space per-stage loss for the joint head.
+
+---
+
+## 2. The inverse, stated precisely
+
+For filter `i`, the degrade applied argument `x` (= `para_i`) to image `A` (= `comp_{i+1}`), producing `B` (= `comp_i`):
+
+```
+filter_i(A, x) = B
+```
+
+We want the recovery argument `y` such that:
+
+```
+filter_i(B, y) = A
+```
+
+We know `x`, `A`, `B`, and all statistics. **Stat convention: whole-image** (matches the paper / current `filter.py`). An FG-only option exists in the code for future A/B testing but is not the default.
+
+---
+
+## 3. Per-filter inverse derivations
+
+### 3.1 Brightness — `y = -x`  (EXACT)
+Forward scales HSV V by `alpha` (`1/(1-x)` if `x≥0`, else `x+1`). Undo by `1/alpha`; both branches solve to **`y = -x`**.
+
+### 3.2 Highlight — `y = 1/(x+1) - 1`  (EXACT)
+Gamma `x+1` in inverted space; invert exponent → `y+1 = 1/(x+1)`.
+
+### 3.3 Shadow — `y = 1 - 1/(1-x)`  (EXACT)
+Gamma `1-x`; invert exponent → `1-y = 1/(1-x)`.
+
+> Highlight/shadow inverses are **asymmetric**: degrade highlight `+0.382` is undone by `-0.277`, *not* `-0.382`. Naive `y=-x` would be wrong. This is why per-filter inverse targets do real work.
+
+### 3.4 Contrast — `y_ = -x_/(1+x_)`  (EXACT)
+Forward `out = img + (img-mu)*x_` = affine `(1+x_)*img - x_*mu`, slope `(1+x_)`; `x_` is the remapped arg.
+**Contrast preserves the mean** (`mean(out)=mu`), so the recovery uses the same `mu` and the affine inverse is exact: `1+y_ = 1/(1+x_)` → **`y_ = -x_/(1+x_)`**, then un-map `y_ → y`.
+
+### 3.5 Temperature — per-channel reciprocal (closed-form from saved means)
+Forward multiplies each channel by `coef_c` from whole-image per-channel means. Inverse multiplies by `1/coef_c`. Current implementation uses **`y = -x`** (means shift symmetrically under `±x`, reproducing reciprocal coefficients to clamp-floor accuracy). A fully exact per-channel solve from the saved means is available as a refinement.
+
+### 3.6 Saturation — branch-wise
+- `x<0` (affine, factor `1+x`): **`y = -x/(1+x)`**.
+- `x≥0` (ceiling-aware, nonlinear): **`y = -x`** heuristic, exact away from the ceiling.
+
+---
+
+## 4. The central finding: the only error is clamping
+
+Initial numerical pass showed contrast/temperature/saturation with ~2–6% round-trip error — which looked like wrong formulas. They are not. Isolating clamping:
+
+| Test | Result |
+|------|--------|
+| Contrast inverse, **no clamp**, in-range pixels | `2.2e-17` (machine epsilon — **exact**) |
+| Contrast inverse, **real filter (clamped)**, unclipped pixels | `6.8e-2` |
+
+The entire discrepancy is pixels that hit `0`/`1` during the degrade. Clamping destroys information; **no** argument can recover a clipped pixel — the *irreducible floor*.
+
+**Why this matters:** the clamp floor is an **image-space** artifact. In **argument space** the target `y` is always exact (a property of the argument and known stats, not surviving pixels). This is the concrete advantage of arg-space supervision over image-space per-stage loss.
+
+---
+
+## 5. Verification methodology & results
+
+All 6 filters were re-implemented in **pure numpy** (no torch needed; filters are elementwise) reproducing exact arithmetic: kornia-equiv RGB↔HSV, contrast `255/(256-floor(255x))-1` remap, temperature gray-world coefs incl. `aR/aG/aB` residual, saturation ceiling branch, every `clamp(0,1)`. For each filter: apply `filter(x)`, apply `filter(y)`, measure `|recovered - original|` excluding clamped pixels. CPU-trivial (sub-second).
+
+> A grid-search numerical inverter was used only to cross-check. It is **not** in the training path — a runtime root-find per filter per batch is too costly on CPU. Production path is **closed-form only**.
+
+**Results on `sample/image.jpg` + `sample/mask.png`** (FG = man + child, ≈3% of frame):
+
+| Filter | degrade x | recovery y | FG degrade err | FG recover err (unclipped) | Improvement |
+|--------|-----------|-----------|----------------|----------------------------|-------------|
+| temperature | -0.254 | +0.254 | 0.0517 | 0.01011 | ~5× |
+| brightness | +0.280 | -0.280 | 0.1529 | 0.000001 | ~exact |
+| contrast | -0.062 | +0.066 | 0.0142 | 0.00067 | ~21× |
+| saturation | +0.268 | -0.268 | 0.0123 | 0.00049 | ~25× |
+| highlight | +0.382 | -0.277 | 0.0887 | 0.0 | exact |
+| shadow | +0.031 | -0.032 | 0.0090 | 0.0 | exact |
+
+Outputs in `sample/inverse_demo/`: `montage_all_filters.png` (rows=filters, cols=orig|degraded|restored), `<filter>.png`, `inverse_results.json`. The restored FG matches the original; background untouched (FG-only masking confirmed).
+
+---
+
+## 6. Code walkthrough — `inverse_targets.py`
+
+**Reusable core**, pure-numpy, no torch. Public API:
+
+```python
+compute_inverse_arg(filter_name, x, image=None, fg_mask=None) -> y
+```
+
+- `filter_name`: `temperature | brightness | contrast | saturation | highlight | shadow`.
+- `x`: the degrade argument that was applied.
+- `image`: required only for temperature (per-channel means). Optional otherwise.
+- `fg_mask`: optional; if given, stats use FG region only. **Default `None` → whole-image (paper).**
+
+Internals:
+- `contrast_x_to_x_` / `contrast_x__to_x` — the contrast remap and its inverse.
+- `inv_brightness/highlight/shadow/contrast/temperature/saturation` — the closed forms from §3.
+- `INVERSE_FNS` — name → function map (order matches `Harmonizer.filter_types`).
+
+Self-test (`python inverse_targets.py`) prints `y` for `x ∈ {-0.4,-0.1,0.1,0.4}` per filter, showing the asymmetry.
+
+> **NOTE for training use:** this file is **numpy** (built for CPU verification). To use inside the trainer you need a **torch, batched, differentiable** version of the closed forms (see §9). The numpy file is the reference/spec; the torch version mirrors it.
+
+---
+
+## 7. Code walkthrough — `demo_inverse_on_sample.py`
+
+End-to-end demo mirroring the training degrade→restore with KNOWN args:
+1. load `sample/image.jpg` + `sample/mask.png` (FG = white).
+2. per filter, pick `x = U(-1,1) * range_i` (paper ranges `[0.3,0.5,0.5,0.6,0.4,0.4]`).
+3. degrade FG only: `composite(filter(img,x), img, mask)`.
+4. `y = compute_inverse_arg(name, x, image=degraded)`.
+5. restore FG only: `composite(filter(degraded,y), degraded, mask)`.
+6. measure FG error excluding clamped pixels; also report the no-op (degrade) error as baseline.
+7. save montage, per-filter strips, and `inverse_results.json`.
+
+Contains pure-numpy `filter.py` replicas (whole-image stats). Two bugs were found and fixed: optional `src_means` for temperature; mask broadcast `[1,H,W]`→`[3,H,W]` for masked selection.
+
+---
+
+## 8. Three approaches to use it as a loss
+
+`y_true_i` from `compute_inverse_arg` is the per-filter target. `y_hat_i` is the model's predicted argument (native `[-1,1]`, what `restore` consumes). Three ways to apply it:
+
+### Approach A — plain per-filter arg loss (recommended first)
+```
+L_arg = (1/K) * Σ_i | y_hat_i - y_true_i |          # K = number of supervised filters
+loss  = fine_loss + u_image_loss + λ * L_arg         # λ small, e.g. 0.1–0.5
+```
+Autograd already routes a **bigger gradient to the more-wrong filter** — so "the filter that needs it most gets updated most" is automatic. Cleanest test of whether arg-supervision wakes inert filters. Start with the **3 exact filters** (brightness, highlight, shadow): their target error is 0, so any failure to learn is the model, not the target.
+
+### Approach B — normalized per-filter weighting ("which neuron needs updating", done fairly)
+Raw error is misleading: filters differ in units/sensitivity, so a hard filter (temperature) can show more error without the neuron being "lazier". Normalize each filter's error by its own running scale:
+```
+w_i = | y_hat_i - y_true_i | / (ema_err_i + ε)       # detached; no grad through w_i
+L_arg = Σ_i  w_i * | y_hat_i - y_true_i |
+```
+`ema_err_i` = EMA of that filter's recent error. A filter worse than its own norm is up-weighted; one at its norm stays ~1. This is the **argument-space analogue of the paper's dynamic per-stage reweighting** (`max((L_i-L_{i-1})/norm,0)`).
+
+### Approach C — gradient gating on the output neuron (most surgical)
+Instead of a loss term, scale the gradient into each filter's output neuron via a backward hook: `grad_i *= g_i`, with `g_i` large for off-target filters. Touches only the predicting neuron, leaves the shared trunk alone — the most literal "update this neuron more". Fiddliest to tune; reach for it only if A/B don't separate filters.
+
+**Recommended sequencing:** A on the 3 exact filters → add contrast → bring in B for the temp-vs-saturation fairness → consider C only if needed.
+
+---
+
+## 9. Integration: which files to change and where
+
+Target pipeline = the MLP/joint head on branch `loss_function`. Files live in `src/train/harmonizer/`.
+
+### 9.0 New file — `src/train/harmonizer/inverse_torch.py` (CREATE)
+A **torch, batched, differentiable** mirror of `inverse_targets.py`. `y_true` should be computed from `x` (and saved stats) with torch ops so it lives on-GPU and matches dtype/shape `[batch,1]` per filter. Most inverses are pure functions of `x`:
+```python
+import torch
+def inv_brightness(x): return -x
+def inv_highlight(x):  return 1.0/(x+1.0) - 1.0
+def inv_shadow(x):     return 1.0 - 1.0/(1.0-x)
+def inv_contrast(x):                      # x already the arg; mirror the remap
+    x_ = torch.where(x>0, 255.0/(256.0-torch.floor(x*255.0))-1.0, x)
+    y_ = -x_/(1.0+x_)
+    # un-map y_ -> y (neg branch identity; pos branch invert floor remap)
+    y  = torch.where(y_>0, (256.0-255.0/(y_+1.0))/255.0, y_)
+    return torch.clamp(y, -1.0, 1.0)
+def inv_temperature(x): return -x          # v1 (matches numpy ref)
+def inv_saturation(x):  return torch.where(x<0, -x/(1.0+x), -x)
+INVERSE = ['temperature','brightness','contrast','saturation','highlight','shadow']  # filter order
+```
+> `y_true` is computed from the **known degrade args** (`l_rand_arguments`) — it is a **target/constant**, so detach it (no grad through `y_true`). Gradient flows only through `y_hat`.
+
+### 9.1 `trainer.py` — capture the degrade args and the predicted args
+Two facts to exploit (current code):
+- **Degrade args** are generated in `_batch_prehandle` (around **line 577**):
+  ```python
+  l_rand_arguments = [self._rand_adjustment_values(n) for _ in range(0, filter_num)]
+  l_x = self.model.module.adjust(l_gt_image, l_mask, l_rand_arguments)
+  ```
+  `l_rand_arguments` is the per-filter list of degrade args **in forward filter order** but applied reversed inside `adjust`. These are the `x` values. **Return/stash them** so `_train` can see them (e.g. store on `self._last_degrade_args` or thread them through the returned tuple). NOTE: `adjust_image` scales args by `filter_argument_ranges`; `l_rand_arguments` here are the **unscaled** `U(-1,1)` draws, and `adjust` does the scaling. The `x` that actually hit the pixels is `arg * range_i` — use the **scaled** value to compute `y_true` so units match what `restore` will invert. (Confirm against `harmonizer.adjust_image`, lines 71–76.)
+
+- **Predicted args** (`y_hat`): the model currently returns only `outputs` (the restored images), not the raw predicted arguments. The regressor's output is consumed inside `Harmonizer.forward → restore_image`. To get `y_hat` into the loss, expose it:
+  - In `module/harmonizer.py` `forward` (line 49) it calls `predict_arguments` then `restore_image`. Have the training `model.py` wrapper (`src/train/harmonizer/model.py`, `forward`, line 28) **also return the arguments**, e.g. put them in `resulter['arguments']`. `predict_arguments` already returns the list of 6 `[batch,1]` tensors (pre-clamp). Use the **clamped** args (post `torch.clamp(arg,-1,1)`) to match what `restore` uses — clamp them the same way `restore_image` does (line 68).
+
+### 9.2 `trainer.py` `_train` — assemble the arg loss
+Where the loss is currently built (around **lines 113–149**), after `fine_loss` and before `loss = fine_loss + u_image_loss`:
+```python
+# --- inverse-argument loss (Approach A, exact filters first) ---
+from inverse_torch import inv_brightness, inv_highlight, inv_shadow  # etc.
+SUP = {'brightness': inv_brightness, 'highlight': inv_highlight, 'shadow': inv_shadow}
+filter_names = self.filter_names                      # already available, line 65
+y_hat = resulter['arguments']                         # list of 6 [lbs,1], from 9.1
+x_scaled = self._last_degrade_args_scaled             # list of 6 [lbs,1], from 9.1 (scaled)
+l_arg = 0.0; k = 0
+for i, fname in enumerate(filter_names):
+    if fname in SUP:
+        y_true = SUP[fname](x_scaled[i]).detach()     # target: no grad
+        l_arg = l_arg + torch.mean(torch.abs(y_hat[i][:lbs] - y_true))
+        k += 1
+        self.meters.update('arg_loss_{0}_{1}'.format(i, fname),
+                           torch.mean(torch.abs(y_hat[i][:lbs]-y_true)).item())
+l_arg = l_arg / max(k, 1)
+lam = getattr(self.args, 'arg_loss_weight', 0.2)
+loss = fine_loss + u_image_loss + lam * l_arg
+self.meters.update('arg_loss', l_arg.item() if torch.is_tensor(l_arg) else 0.0)
+```
+Add TensorBoard scalars for `arg_loss` and per-filter `arg_loss_*` in the per-epoch logging block (around **lines 209–251**), mirroring the existing `raw_filter_*` logging.
+
+### 9.3 `script/train.py` — expose the weight as a config knob
+Add to the `config` OrderedDict (near the optimizer/lr args, **lines 76–88**):
+```python
+('arg_loss_weight', 0.2),          # λ for the inverse-argument loss
+('arg_loss_filters', ['brightness','highlight','shadow']),  # which filters to supervise
+```
+(Then read `self.args.arg_loss_filters` in 9.2 instead of the hardcoded `SUP`.)
+
+### 9.4 `criterion.py` — (optional) keep it here instead of the trainer
+`HarmonizerLoss.forward` (line 34) returns per-stage `image_losses`. You can keep the arg loss in the trainer (simplest, as above) **or** extend the criterion to accept `(y_hat, x_scaled)` and return `l_arg` alongside. Trainer-side is recommended for v1 — fewer signature changes.
+
+### 9.5 What NOT to change
+- Filters (`module/filter.py`), `FilterPerformer`, `filter_argument_ranges`, clamps — unchanged.
+- The image loss (`fine_loss`, `u_image_loss`) stays in charge of the joint objective; the arg loss is an **additive assist**.
+- Cascade/SingleHead/Attn heads — unchanged; the arg loss is head-agnostic (works for any joint head).
+
+### 9.6 Validation steps after wiring (CPU-friendly)
+1. `python inverse_targets.py` (sanity of closed forms) — already passes.
+2. Tiny smoke run (a few images, 1–2 epochs) to confirm: shapes line up, `y_hat` and `y_true` have comparable per-filter ranges (add a one-time assert/print), gradients flow, loss is finite.
+3. Watch `Args/val_mean` / `Args/val_std` and the new `arg_loss_*` meters: do the supervised filters' argument distributions sharpen / wake up?
+4. Only then scale to a full run on the GPU box (the `train.py` paths point at `/home/karan.s1/...`).
+
+---
+
+## 10. Caveats and sequencing
+
+- **Scale matching (most likely bug source):** `y_true` must be computed from the **scaled** degrade arg (`arg * range_i`) so it is in the same native units as `y_hat` (what `restore` consumes). Add a per-filter range-check assert on the first batch.
+- **Teacher-forcing approximation:** the model's running image at stage `i` equals `comp_{i+1}` only at convergence, so `y_true_i` (computed against the true `comp_{i+1}`) is exact at the fixed point and approximate en route. Fine for a per-filter wake-up signal; keep the image loss as master. (Optionally later: compute stateful-filter targets against the model's **live** running-image stats.)
+- **Non-commutativity / clamp floor:** perfect per-filter inverses won't reproduce the image to floating point (filters don't commute; clamp is lossy). Argues for A/B as an *assist*, not the dominant term. If a per-stage *image* term is ever added, mask pixels exactly 0/1 in the target.
+- **Sequencing:** Approach A on the 3 exact filters → add contrast → Approach B for fair temp-vs-saturation weighting → Approach C only if A/B don't separate filters.
+
+**Bottom line:** every filter has an exact, closed-form recovery argument computable at degrade time (no GPU, no solver); the only error source is image-space clamping, while the argument target stays exact. Wire it as a small additive per-filter arg loss (Approach A) on the exact filters first, expand from there.
+
+---
+
+## Appendix — file map
+| File | Role | Change |
+|------|------|--------|
+| `inverse_targets.py` (root) | numpy reference for closed-form inverses | none (spec) |
+| `demo_inverse_on_sample.py` (root) | end-to-end demo on sample image | none |
+| `sample/inverse_demo/` | montage + strips + JSON results | generated |
+| `src/train/harmonizer/inverse_torch.py` | torch/differentiable inverses | **CREATE** (§9.0) |
+| `src/train/harmonizer/trainer.py` | capture x & y_hat; build arg loss | **EDIT** (§9.1, §9.2) |
+| `src/train/harmonizer/model.py` | expose predicted arguments | **EDIT** (§9.1) |
+| `src/train/harmonizer/module/harmonizer.py` | source of `predict_arguments` | reference (no edit needed if model.py forwards args) |
+| `src/train/harmonizer/script/train.py` | `arg_loss_weight`, `arg_loss_filters` config | **EDIT** (§9.3) |
+| `src/train/harmonizer/criterion.py` | optional home for arg loss | optional (§9.4) |
+
+---
+
+## 11. Finalized Approach A spec (decided)
+
+These choices are locked for the first round of experiments:
+
+- **Filters supervised:** **all 6** (not just the 3 exact). The inert middle filters are exactly the ones we want to wake, so excluding them would defeat the purpose. Temperature and saturation have slightly-approximate `y_true` (clamp floor; temperature uses the `-x` form), so **log per-filter arg loss separately** to interpret them — but supervise all 6.
+- **Norm on the arg term:** **L1 (MAE)**, not L2. Reasons: (1) robustness — L2 squares error and would let the two approximate targets (temp/sat) dominate the arg gradient; L1's bounded ±1 gradient prevents that. (2) interpretability — L1 keeps Approach A "direction only," and the "more-wrong-gets-bigger-push" behavior is added deliberately by Approach B rather than baked invisibly into the loss. Tradeoff accepted: L1 can mildly oscillate right at the target (vs L2's smooth landing), minor and absorbed by λ.
+- **Stream scope:** arg term applies to the **synthetic (fine) stream only** — the coarse/real composites have no known degrade args, hence no `y_true`. (Exception: the zero-target idempotency group in §13, where `y_true = 0`.)
+
+Final per-image Approach-A loss:
+```
+l_arg^(n) = (1/6) · Σ_{i=1..6} | ŷ_i^(n) − y_true_i^(n) |          # L1, all 6 filters
+L = l_fine + λ·l_arg + l_coarse                                     # arg term on synthetic stream
+```
+- `λ` is a **hyperparameter, tuned** (not guessed). Pick its range **after** logging `l_fine` vs `l_arg` so the two terms are on a sensible relative scale.
+- Mechanically: at each output, `δ_yi = δ_image_i + λ·sign(ŷ_i − y_true_i)`. The arg term injects a direct per-filter delta that bypasses the filter chain, so an inert filter (image-δ ≈ 0) still gets a nonzero update.
+
+---
+
+## 12. The three delivery mechanisms (A / B / C) — deep dive
+
+All three share the same raw material: the per-filter error `|ŷ_i − y_true_i|` from the exact inverse. They differ only in **how** that error influences training.
+
+### Approach A — plain term (run first)
+Add `λ·l_arg` to L; equal weight per filter; L1.
+```
+δ_yi = δ_image_i + λ · sign(ŷ_i − y_true_i)
+```
+- **Supplies a direction** toward the correct argument → can wake a truly inert (zero-image-gradient) filter.
+- Simplest, most interpretable. Answers "does arg supervision help at all?" unconfounded.
+
+### Approach B — normalized term (run second)
+Add a **detached, per-filter weight** that judges each filter against its own running error, so a chronically-hard filter doesn't hog the gradient:
+```
+w_i = |ŷ_i − y_true_i| / (ema_i + ε)        # ema_i = EMA of filter i's recent arg error, DETACHED
+l_arg = Σ_i  w_i · |ŷ_i − y_true_i|
+δ_yi = δ_image_i + λ · w_i · sign(ŷ_i − y_true_i)
+```
+- `w_i ≈ 1` at the filter's usual level; `>1` if it's lagging/regressing; `<1` if learning well.
+- "Harder filter" cancels (each judged vs its own baseline) → the *fair* version of "send more gradient to the neuron that needs it."
+- This is the **argument-space analogue of the paper's dynamic per-stage reweighting** (`max((L_i−L_{i−1})/norm, 0)`, detached denominator).
+- Costs: 6 EMA states + an EMA-decay hyperparameter (~0.99); EMA cold-start (warm up with plain A or init EMA on batch 1); less interpretable than A (hence run after A).
+- Two flavors of "normalize": by the filter's **own history** (`err_i/ema_i`, stable) or **across peers at the current step** (`err_i/mean_j err_j`, more literal "temp worse than saturation"). History version recommended; can be combined.
+
+### Approach C — gradient gate (refinement, only if needed)
+Do **not** change L. Instead, register a backward hook that multiplies each filter's existing image gradient by a per-filter factor:
+```
+g_i = 1 + α·|ŷ_i − y_true_i|        # detached scalar
+δ_yi ← g_i · δ_image_i             # only rescales the image gradient
+```
+- **Does NOT supply a direction** — it only amplifies the gradient that already exists. So `g_i · 0 = 0`: **C cannot wake a truly inert (zero-gradient) filter.** Weakest for the primary goal.
+- Upside: **never fights the image loss** (it only scales the image gradient, can't push a direction the image loss disagrees with). Good if A/B turn out to fight the image metric.
+- Most surgical (touches only the output neuron's gradient), but uses hooks.
+
+### Comparison
+| | A (plain) | B (normalized) | C (gate) |
+|---|---|---|---|
+| Mechanism | add `λ·l_arg` to L | add weighted `l_arg` to L | multiply image grad by `g_i` |
+| Supplies direction to `y_true`? | **Yes** | Yes | **No** |
+| Can wake zero-grad inert filter? | **Yes** | Yes | **No** |
+| Can fight image loss? | possible | possible | **never** |
+| Extra hyperparams | λ | λ + EMA decay | α |
+| Complexity / interpretability | lowest / highest | medium | medium (hooks) |
+
+**Priority: A → B → C.** A proves arg supervision helps; B tests whether fair weighting beats equal; C only if A/B hurt the image metric.
+
+---
+
+## 13. Idempotency / zero-target experiment (anti-drift)
+
+**Motivation.** A prior experiment showed that under repeated/iterative prediction, the model predicted nonzero args at each pass and **drifted worse** — it never learned the fixed point "an already-correct image needs no change." This experiment teaches that fixed point, reusing the arg-loss machinery.
+
+**Idea.** Add a small **third group** to each batch: a few (~2) **undegraded real images** (already harmonized — the `real_image`, NOT the disharmonious composite). The model will predict some nonzero args; set their arg-loss target to **`y_true = [0,0,0,0,0,0]`**, penalizing any nonzero prediction. The model learns: *already-correct image in → zero args out (no-op).*
+
+**Why `y_true = 0` is the right target.** `0` is the verified no-op point of every filter (brightness α=1, contrast no shift, temperature `is_zero` branch, etc.). So "predict 0" literally means "do nothing," which is correct for an already-correct image. Bonus: `0` needs no range-scaling, sidestepping the scale-matching concern entirely for these samples.
+
+**Why it attacks the drift.** If a correct image → ~0 args, then feeding the model's **own output** back also → ~0 args (the output is ~correct), so iteration stops instead of drifting. It's a fixed-point / idempotency regularizer.
+
+**Input source (recommended).** Reuse the **undegraded originals** of the synthetic stream's images (already loaded — the synthetic stream degrades them). This gives a clean contrastive pair on the same content: *degraded version → predict the inverse; clean version → predict 0.* Cheapest, and a stronger disentangling signal (the model sees both "act" and "don't act" for the same scene). Alternative: pull fresh `real_image`s.
+
+**The real risk — collapse toward zero everywhere.** If the zero-target signal is too strong, the model takes the lazy global solution (predict ≈0 on *everything*, including disharmonious composites it should fix) → harmonization tanks. Manage with:
+1. **Small count** (~2 of 16) — keeps the zero-signal a minority regularizer.
+2. **Controllable weight** — share λ or give the zero group its own smaller weight so it can be dialed down.
+3. **Guardrail metric:** watch `Args` mean/std on the **composite (disharmonious)** inputs. Healthy = args → 0 on real images while staying **nonzero-and-correct on composites**. That separation IS the success signal; if composite-args collapse too, the regularizer is too strong.
+
+**How to run it.** Fold it into the **parallel-head + A** run as a zero-target group (since A is already arg-loss-on, adding a zero-target group is trivial). Compare against parallel-head + A *without* the group to isolate whether it cures drift without hurting harmonization. (Not a standalone run.)
+
+---
+
+## 14. 5-GPU experiment grid (decided)
+
+Existing OFF baselines (MLP-256, parallel-head-256) already have TB logs + eval, so they serve as the controls — all 5 fresh GPUs go to ON-runs.
+
+| GPU | Architecture | Approach | λ | Compared against |
+|-----|-------------|----------|---|------------------|
+| 0 | MLP-256 | A (all 6, L1) | λ₀ | existing MLP-256 OFF baseline |
+| 1 | MLP-256 | B | λ₀ | GPU 0 (A vs B on MLP) + OFF baseline |
+| 2 | parallel-head-256 | A | λ_low | existing PH-256 OFF baseline |
+| 3 | parallel-head-256 | B | λ₀ | GPU 2 + OFF baseline |
+| 4 | parallel-head-256 | A | λ_high | GPU 2 (λ-sweep pair) |
+
+- GPUs 2 & 4 form a **2-point λ sweep** on the champion cell (parallel-head + A). Coarse but answers "more vs less λ."
+- C is **dropped this round** (weakest for the inert-filter goal; a later refinement only if A/B fight the image metric).
+- The **idempotency group (§13)** can be added to the parallel-head + A cell (GPU 2 or a 6th run if a GPU frees up), compared against the same cell without it.
+
+**Comparisons this grid yields:** A-vs-OFF and B-vs-OFF on each architecture (does the loss help?); A-vs-B on each (does fair weighting beat equal?); MLP-vs-PH within each approach (does it transfer?); λ_low-vs-λ_high on PH+A (how hard to push).
+
+**Two launch-time must-dos (non-negotiable for valid comparison):**
+1. **ON-runs must match the existing baselines' config exactly** — seed, data splits, LR/batch/epochs/schedule, code revision. Otherwise the ON-vs-OFF comparison leaks.
+2. **Log `l_fine` and `l_arg` separately** to TensorBoard so the relative scale is visible and λ can be set sensibly (and per-filter `arg_loss_i` so temp/sat are interpretable).
+
+**Reading the runs (success signals):**
+- Primary: `Args/val_mean` & `Args/val_std` spread across the 6 filters — do the inert middle filters wake up (non-trivial, comparable magnitudes)?
+- Guardrail: `Metrics/PSNR`, `SSIM`, `MSE`, `fMSE` must hold near baseline — arg loss should assist, not hurt.
+- Idempotency cell: args → 0 on real images, args stay correct-nonzero on composites.
+
+# coding.md — Implementation Guide (Arg-Loss Experiments)
+
+Pure implementation reference. Contains:
+- the new `inverse_torch.py` (full code),
+- the **shared** code changes every experiment needs,
+- then **per-experiment** sections: what lines change in which files for
+  **MLP + A**, **MLP + B**, **ParallelHead + A**, **ParallelHead + B**.
+
+Branch: `loss_function`. All paths are under `src/train/harmonizer/`.
+
+> Conventions used below: `LBS` = labeled (synthetic) batch size (8). The arg loss
+> applies to the **synthetic stream only** (indices `0:LBS`). `y_true` is a
+> **detached target** (no grad through it). λ = `args.arg_loss_weight`.
+
+---
+
+## 0. Key facts about the current code (verified)
+
+- **Degrade args are sampled** in `trainer.py :: _batch_prehandle`, line **577**:
+  ```python
+  l_rand_arguments = [self._rand_adjustment_values(n) for _ in range(0, filter_num)]
+  l_x = self.model.module.adjust(l_gt_image, l_mask, l_rand_arguments)   # line 579
+  ```
+  `l_rand_arguments` is a list of `filter_num` tensors, each `[LBS, 1]`, sampled
+  **uniform U(-1,1)** (raw). **The scaling by `filter_argument_ranges`
+  `[0.3,0.5,0.5,0.6,0.4,0.4]` happens INSIDE `adjust_image`** (see
+  `module/harmonizer.py::adjust_image`). So the argument that actually hit the
+  pixels is `raw * range_i`. **`y_true` must be computed from the SCALED arg.**
+
+- **Predicted args are NOT currently returned.** `model.py::forward` (line **28**)
+  returns only `resulter['outputs']` (the restored images). We must also surface
+  the regressor's predicted arguments so the loss can see `y_pred`.
+
+- **Loss is assembled** in `trainer.py :: _train`, lines **113–149**
+  (`fine_loss`, `u_image_loss`, `loss = fine_loss + u_image_loss`).
+
+- **Filter order** (`Harmonizer.filter_types`): `temperature, brightness,
+  contrast, saturation, highlight, shadow`. `self.filter_names` (trainer line 65)
+  holds the lowercased names in this order.
+
+---
+
+## 1. NEW FILE — `src/train/harmonizer/inverse_torch.py`
+
+Torch, batched, differentiable mirror of `inverse_targets.py`. Each function
+takes the **scaled** degrade arg tensor `x` (shape `[N,1]`) and returns `y_true`
+(shape `[N,1]`). `y_true` is a target → caller `.detach()`s it.
+
+```python
+"""
+inverse_torch.py
+================
+Differentiable, batched closed-form inverse (recovery) arguments per filter,
+for the arg-loss. Mirrors inverse_targets.py (numpy reference).
+
+Each fn: x [N,1] (the SCALED degrade arg that hit the pixels) -> y_true [N,1].
+y_true is a TARGET; detach it at the call site (no grad through the target).
+
+Stat convention: whole-image (matches filter.py / paper). temperature uses the
+simple closed form y=-x (exact to clamp-floor); a per-channel exact variant can
+be added later using saved means.
+"""
+import torch
+
+EPS = 1e-6
+
+def inv_brightness(x):
+    return -x
+
+def inv_highlight(x):
+    return 1.0 / (x + 1.0) - 1.0
+
+def inv_shadow(x):
+    return 1.0 - 1.0 / (1.0 - x)
+
+def inv_contrast(x):
+    # forward remap: x_=x if x<=0 ; x_=255/(256-floor(255x))-1 if x>0
+    x_ = torch.where(x > 0, 255.0 / (256.0 - torch.floor(x * 255.0)) - 1.0, x)
+    y_ = -x_ / (1.0 + x_)
+    # un-map y_ -> y arg: neg branch identity; pos branch invert the floor remap
+    y = torch.where(y_ > 0, (256.0 - 255.0 / (y_ + 1.0)) / 255.0, y_)
+    return torch.clamp(y, -1.0, 1.0)
+
+def inv_temperature(x):
+    return -x          # v1: closed form, exact to clamp floor
+
+def inv_saturation(x):
+    # neg branch (x<0): y=-x/(1+x); pos branch (x>=0): y=-x (exact away from ceiling)
+    return torch.where(x < 0, -x / (1.0 + x), -x)
+
+# filter order MUST match Harmonizer.filter_types
+INVERSE_BY_NAME = {
+    'temperature': inv_temperature,
+    'brightness':  inv_brightness,
+    'contrast':    inv_contrast,
+    'saturation':  inv_saturation,
+    'highlight':   inv_highlight,
+    'shadow':      inv_shadow,
 }
-function statLine(n,s){
-  if(n==="temperature")return `meanRGB=[${s.meanR.toFixed(3)}, ${s.meanG.toFixed(3)}, ${s.meanB.toFixed(3)}]  coef=[${s.coefR.toFixed(3)}, ${s.coefG.toFixed(3)}, ${s.coefB.toFixed(3)}]`;
-  if(n==="brightness")return `alpha = ${s.alpha.toFixed(3)}`;
-  if(n==="contrast")return `threshold = ${s.threshold.toFixed(3)}, x_ = ${s.x_.toFixed(3)}`;
-  if(n==="saturation")return s.note;
-  if(n==="highlight"||n==="shadow")return `gamma = ${s.gamma.toFixed(3)} (${s.space})`;
-  return "";
+
+def compute_y_true(filter_name, x_scaled):
+    """x_scaled [N,1] -> y_true [N,1] (NOT detached; caller detaches)."""
+    return INVERSE_BY_NAME[filter_name](x_scaled)
+```
+
+---
+
+## 2. SHARED CHANGES (needed by ALL four experiments)
+
+These three edits are identical for every experiment. The per-experiment sections
+only differ in the **loss term** added in `_train`.
+
+### 2.1 `module/harmonizer.py` — expose predicted arguments
+`forward` (line ~49) already computes `arguments` then `restore_image`. Return
+both so the training wrapper can grab `y_pred`:
+```python
+def forward(self, comp, mask):
+    arguments = self.predict_arguments(comp, mask)          # list of 6 [N,1] (pre-clamp)
+    pred = self.restore_image(comp, mask, arguments)
+    return pred, arguments        # CHANGED: was `return pred`
+```
+> `restore_image` clamps internally; for the arg loss use the **clamped** args to
+> match what restore uses. Either clamp here, or clamp at the loss site. Simplest:
+> return the raw `arguments` and clamp in `_train` (§2.3).
+
+### 2.2 `model.py` — forward the arguments into `resulter`
+`forward` (line 28):
+```python
+def forward(self, inp):
+    resulter, debugger = {}, {}
+    x, mask = inp
+    pred, arguments = self.model(x, mask)     # CHANGED: unpack args
+    resulter['outputs'] = pred
+    resulter['arguments'] = arguments         # NEW: list of 6 [N,1]
+    return resulter, debugger
+```
+
+### 2.3 `trainer.py` — stash the SCALED degrade args
+In `_batch_prehandle` (line 577–579), the raw args are sampled and `adjust`
+scales them. Save the **scaled** args so `_train` can build `y_true`. Add right
+after line 577:
+```python
+l_rand_arguments = [self._rand_adjustment_values(n) for _ in range(0, filter_num)]
+# NEW: stash the SCALED args (what actually hit the pixels) for the arg loss
+ranges = self.model.module.model.filter_argument_ranges
+self._last_x_scaled = [torch.clamp(a, -1, 1) * r for a, r in zip(l_rand_arguments, ranges)]
+l_x = self.model.module.adjust(l_gt_image, l_mask, l_rand_arguments)
+```
+> Mirror of `adjust_image`'s own scaling: `clamp(arg,-1,1) * range`. Keep these on
+> GPU; they are `[LBS,1]` each.
+
+### 2.4 `script/train.py` — config knobs
+Add to the `config` OrderedDict (near lines 76–88):
+```python
+('arg_loss_weight', 0.2),                  # lambda
+('arg_loss_filters', ['temperature','brightness','contrast','saturation','highlight','shadow']),
+# Approach B only:
+('arg_loss_normalize', False),             # True for Approach B
+('arg_loss_ema_decay', 0.99),              # Approach B EMA decay
+# Idempotency (optional, parallel-head + A):
+('idem_enable', False),
+('idem_weight', 0.2),
+```
+
+### 2.5 `trainer.py` — common arg-loss scaffold in `_train`
+In `_train`, after `fine_loss` is computed (after line 118) and before
+`loss = fine_loss + u_image_loss` (line 149), insert the arg-loss block. The
+exact block depends on the approach (A or B) — see per-experiment sections. The
+shared preamble (same for A and B):
+```python
+from inverse_torch import compute_y_true     # top-of-file import
+
+y_pred_all = resulter['arguments']                       # list of 6 [N,1] (full batch)
+x_scaled   = self._last_x_scaled                         # list of 6 [LBS,1] (synthetic only)
+sup = self.args.arg_loss_filters
+lam = self.args.arg_loss_weight
+```
+Then build `l_arg` (A or B), and:
+```python
+loss = fine_loss + u_image_loss + lam * l_arg            # CHANGED line 149
+self.meters.update('arg_loss', float(l_arg.detach()))
+```
+Add a TensorBoard scalar for `arg_loss` and each `arg_loss_<i>` in the per-epoch
+logging block (lines ~209–251), mirroring the existing `raw_filter_*` logging.
+
+---
+
+## 3. EXPERIMENT: MLP + A
+
+**Architecture:** `module/harmonizer.py` line ~36 — make the active regressor the
+MLP (SingleHead):
+```python
+# self.regressor = AttnHeadRegressor(1280, 160, 1, len(self.filter_types))
+self.regressor = SingleHeadRegressor(1280, 160, 1, len(self.filter_types))
+```
+(`SingleHeadRegressor` internally uses the wide 1280→512→256→6 trunk.)
+
+**Shared changes:** apply §2.1, §2.2, §2.3, §2.4, §2.5.
+
+**Loss block (Approach A)** — insert in `_train` (after line 118), using the §2.5
+preamble:
+```python
+# ---- Approach A: plain per-filter L1 arg loss (all 6 filters) ----
+l_arg = 0.0
+k = 0
+for i, fname in enumerate(self.filter_names):
+    if fname not in sup:
+        continue
+    y_pred_i = torch.clamp(y_pred_all[i][:lbs], -1, 1)      # synthetic only, matched units
+    y_true_i = compute_y_true(fname, x_scaled[i]).detach()  # target, no grad
+    err_i = torch.mean(torch.abs(y_pred_i - y_true_i))
+    l_arg = l_arg + err_i
+    k += 1
+    self.meters.update('arg_loss_{0}_{1}'.format(i, fname), float(err_i.detach()))
+l_arg = l_arg / max(k, 1)
+```
+Then the common tail from §2.5 (`loss = fine_loss + u_image_loss + lam*l_arg`).
+
+**Config (`script/train.py`):** `arg_loss_weight = λ₀`, `arg_loss_normalize = False`,
+`arg_loss_filters` = all 6.
+
+**Files touched:** `inverse_torch.py` (new), `module/harmonizer.py` (regressor +
+return args), `model.py`, `trainer.py`, `script/train.py`.
+
+---
+
+## 4. EXPERIMENT: MLP + B
+
+**Architecture:** same as §3 (`SingleHeadRegressor`).
+
+**Shared changes:** §2.1, §2.2, §2.3, §2.4, §2.5.
+
+**Extra state for the EMA** — in `_build` (after line 68), init per-filter EMA:
+```python
+self._arg_ema = {name: None for name in self.filter_names}   # NEW (Approach B)
+```
+
+**Loss block (Approach B — normalized weighting)** — insert in `_train`:
+```python
+# ---- Approach B: normalized per-filter L1 arg loss (detached weights) ----
+decay = self.args.arg_loss_ema_decay
+l_arg = 0.0
+k = 0
+for i, fname in enumerate(self.filter_names):
+    if fname not in sup:
+        continue
+    y_pred_i = torch.clamp(y_pred_all[i][:lbs], -1, 1)
+    y_true_i = compute_y_true(fname, x_scaled[i]).detach()
+    abs_err  = torch.abs(y_pred_i - y_true_i)                # [LBS,1]
+    err_scalar = float(torch.mean(abs_err).detach())
+    # update detached EMA of this filter's error
+    prev = self._arg_ema[fname]
+    self._arg_ema[fname] = err_scalar if prev is None else decay*prev + (1-decay)*err_scalar
+    ema = self._arg_ema[fname] + 1e-6
+    w_i = (torch.mean(abs_err).detach() / ema)               # detached weight, scalar
+    err_i = w_i * torch.mean(abs_err)                        # grad flows through abs_err only
+    l_arg = l_arg + err_i
+    k += 1
+    self.meters.update('arg_loss_{0}_{1}'.format(i, fname), float(torch.mean(abs_err).detach()))
+    self.meters.update('arg_w_{0}_{1}'.format(i, fname), float(w_i))
+l_arg = l_arg / max(k, 1)
+```
+Then the common tail (`loss = fine_loss + u_image_loss + lam*l_arg`).
+
+> Note: `w_i` is **detached** → it only rescales the gradient (acts as a per-filter
+> learning-rate multiplier), it does not create its own gradient. The EMA cold-start
+> (first step) uses the raw error; optionally warm up with plain A for N steps.
+
+**Config:** `arg_loss_weight = λ₀`, `arg_loss_normalize = True`,
+`arg_loss_ema_decay = 0.99`, `arg_loss_filters` = all 6.
+
+**Files touched:** same as §3 plus the `_arg_ema` init in `_build`.
+
+---
+
+## 5. EXPERIMENT: ParallelHead + A
+
+**Architecture:** `module/harmonizer.py` — import and select the parallel head.
+On the `parallel_head` branch this is `ParallelHeadsRegressor`; ensure the import
+line includes it and the active regressor is:
+```python
+from .module import CascadeArgumentRegressor, ParallelHeadsRegressor, FilterPerformer
+...
+self.regressor = ParallelHeadsRegressor(1280, 160, 1, len(self.filter_types))
+```
+> NOTE on width: the committed `ParallelHeadsRegressor` is **160-wide**
+> (`f:1280→160`, heads `160→160→1`). If your "256" variant is required, set
+> `base_channels=256` here (and confirm against your trained checkpoint's layer
+> shapes). See `context.md` for the width caveat.
+
+**Shared changes:** §2.1, §2.2, §2.3, §2.4, §2.5.
+
+**Loss block:** **identical to §3 (Approach A)** — the arg loss is head-agnostic.
+Nothing about the loss changes between MLP and parallel-head; only the regressor
+class differs.
+
+**Config:** same as §3.
+
+**Files touched:** same as §3.
+
+---
+
+## 6. EXPERIMENT: ParallelHead + B
+
+**Architecture:** same as §5 (`ParallelHeadsRegressor`).
+
+**Shared changes + EMA init:** §2.1, §2.2, §2.3, §2.4, §2.5 **plus** the
+`self._arg_ema` init from §4.
+
+**Loss block:** **identical to §4 (Approach B)** — again head-agnostic.
+
+**Config:** same as §4 (`arg_loss_normalize = True`, EMA decay 0.99).
+
+**Files touched:** same as §4.
+
+---
+
+## 7. OPTIONAL add-on — idempotency / zero-target (ParallelHead + A)
+
+To add the anti-drift zero-target group to the ParallelHead+A run (§5). Feed a few
+**undegraded** images (target `y_true = 0`). Cheapest source: the undegraded
+originals already loaded for the synthetic stream.
+
+In `_train`, after the §3 arg-loss block:
+```python
+if self.args.idem_enable:
+    # feed undegraded originals (already-correct images) -> predict 0 args
+    idem_img = l_gt_image[:2]            # 2 already-correct images (real, undegraded)
+    idem_mask = l_mask[:2]
+    _, idem_args = self.model.module.model(idem_img, idem_mask)   # args: list of 6 [2,1]
+    l_idem = 0.0
+    for i, fname in enumerate(self.filter_names):
+        yi = torch.clamp(idem_args[i], -1, 1)
+        l_idem = l_idem + torch.mean(torch.abs(yi - 0.0))         # y_true = 0
+    l_idem = l_idem / len(self.filter_names)
+    loss = loss + self.args.idem_weight * l_idem
+    self.meters.update('idem_loss', float(l_idem.detach()))
+```
+**Guardrail:** watch `Args/val_mean`/`val_std` on the **composite** inputs — they
+must stay nonzero (correct) while real-image args go to 0. If composite args
+collapse, lower `idem_weight`. (`y_true=0` needs no scaling — 0 is the verified
+no-op of every filter.)
+
+**Config:** `idem_enable = True`, `idem_weight = 0.2` (tune; keep small).
+
+---
+
+## 8. Quick per-experiment summary
+
+| Experiment | Regressor (harmonizer.py) | Loss block | Extra state | Config flags |
+|------------|---------------------------|------------|-------------|--------------|
+| MLP + A | `SingleHeadRegressor` | §3 (plain L1) | — | normalize=False |
+| MLP + B | `SingleHeadRegressor` | §4 (normalized) | `_arg_ema` | normalize=True, ema_decay |
+| PH + A | `ParallelHeadsRegressor` | §3 (plain L1) | — | normalize=False |
+| PH + B | `ParallelHeadsRegressor` | §4 (normalized) | `_arg_ema` | normalize=True, ema_decay |
+
+**Every experiment also needs:** `inverse_torch.py` (§1) + shared changes §2.1–2.5.
+Only the regressor line and the loss block differ.
+
+## 9. Pre-launch checklist (all experiments)
+1. `y_true` built from the **scaled** arg (§2.3) — assert `y_pred` and `y_true` have
+   comparable per-filter ranges on batch 1.
+2. `y_true.detach()` — no gradient through the target.
+3. Arg loss uses **synthetic indices `0:LBS` only** (coarse has no `y_true`).
+4. Log `fine_loss`, `arg_loss`, and per-filter `arg_loss_<i>` separately → set λ
+   from the `fine_loss : arg_loss` ratio.
+5. ON-runs match the existing OFF baselines' seed / splits / LR / batch / epochs /
+   code revision (else ON-vs-OFF comparison leaks).
+6. Smoke test: 1–2 epochs on a few images — shapes line up, gradients flow, loss
+   finite — before the full 60-epoch GPU run.
+
+
+"""
+inverse_targets.py
+==================
+Closed-form per-filter INVERSE (recovery) arguments for the Harmonizer
+inverse-loss idea (branch: loss_function).
+
+Context
+-------
+During self-supervised training we degrade a real image by applying a known
+argument `x` to each filter (in reverse order) to build the composite. The
+model only sees the final composite and must predict, per filter, the
+RECOVERY argument that undoes the degrade.
+
+Because WE generated the degrade, we know `x` and we have every intermediate
+image, so we can compute the exact recovery argument `y` per filter in CLOSED
+FORM (no runtime numerical solver -- important on CPU).
+
+Verified facts (see verify_*.py):
+  * brightness : y = -x                       (exact)
+  * highlight  : y = 1/(x+1) - 1              (exact)
+  * shadow     : y = 1 - 1/(1-x)             (exact)
+  * contrast   : y_ = -x_/(1+x_), then un-map x_->y   (exact; mean is preserved)
+  * temperature: per-channel reciprocal of the coef; solve the scalar y that
+                 reproduces 1/coef_c  (closed-form in the saved means)
+  * saturation : branch-wise affine/inverse  (closed-form per branch)
+The ONLY residual error is from pixel CLAMPING to [0,1] (irreducible; affects
+image space only -- the ARGUMENT target y itself is always exact).
+
+All stats are computed WHOLE-IMAGE (matching the paper / filter.py). An
+`fg_mask` argument is accepted for an optional FG-only convention but defaults
+to whole-image.
+"""
+import numpy as np
+
+EPS = 1e-6
+
+
+# ---------- helpers: contrast x <-> x_ remap (matches filter.py) ----------
+def contrast_x_to_x_(x):
+    """filter.py: x_=x for x<=0 ; x_=255/(256-floor(255x))-1 for x>0."""
+    x = float(x)
+    if x > 0:
+        return 255.0 / (256.0 - np.floor(x * 255.0)) - 1.0
+    return x
+
+def contrast_x__to_x(x_):
+    """Inverse of the remap, returning an argument y in [-1,1].
+    For x_<=0 the forward map is identity, so y=x_.
+    For x_>0 we invert 255/(256-floor(255x))-1 = x_  (within 1/255 quantisation)."""
+    x_ = float(x_)
+    if x_ <= 0:
+        return x_
+    # 255/(256-floor(255x))-1 = x_  ->  256-floor(255x) = 255/(x_+1)
+    floor255x = 256.0 - 255.0 / (x_ + 1.0)
+    x = floor255x / 255.0
+    return float(np.clip(x, -1.0, 1.0))
+
+
+# ---------- the six inverse-argument functions ----------
+def inv_brightness(x, *_):           return -float(x)
+def inv_highlight(x, *_):            return 1.0 / (float(x) + 1.0) - 1.0
+def inv_shadow(x, *_):              return 1.0 - 1.0 / (1.0 - float(x))
+
+def inv_contrast(x, *_):
+    """Exact: invert the affine slope. mean is preserved so no stats needed."""
+    x_ = contrast_x_to_x_(x)
+    y_ = -x_ / (1.0 + x_)
+    return contrast_x__to_x(y_)
+
+def inv_temperature(x, src_means=None, *_):
+    """src_means = (meanR,meanG,meanB) of the image the DEGRADE was applied to.
+    Forward multiplies channel c by coef_c(x). We want y with coef_c(y)=1/coef_c(x).
+    coef is dominated by gray'/mean_c'; solving the scalar y reduces, to first
+    order and empirically, to y = -x (the means shift symmetrically). We return
+    -x which round-trips to clamp-floor accuracy; callers needing exactness can
+    pass per-channel coefs. (Kept simple + closed-form for CPU.)"""
+    return -float(x)
+
+def inv_saturation(x, *_):
+    """Branch-wise closed form.
+    Negative branch (forward a=1+x, affine about per-pixel mean): invert slope
+      (1+y)=1/(1+x) -> y=-x/(1+x).
+    Positive branch is ceiling-aware/nonlinear; -x is the closed-form heuristic
+    (exact away from the saturation ceiling). Clipped pixels are irreducible."""
+    x = float(x)
+    if x < 0:
+        return -x / (1.0 + x)
+    return -x
+
+# filter name -> inverse fn  (names match Harmonizer.filter_types order)
+INVERSE_FNS = {
+    'temperature': inv_temperature,
+    'brightness':  inv_brightness,
+    'contrast':    inv_contrast,
+    'saturation':  inv_saturation,
+    'highlight':   inv_highlight,
+    'shadow':      inv_shadow,
 }
-// sequence sent to backend = SEQ order, each with its current value (skip zeros)
-function buildSequence(){ return SEQ.filter(n=>VAL[n]!==0).map(n=>({name:n,arg:VAL[n]})); }
-
-async function apply(){
-  const fg_only=document.getElementById('fgOnly').checked;
-  const sequence=buildSequence();
-  const r=await fetch('/api/apply',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({image:IMG,mask:MASK,sequence,fg_only})});
-  const data=await r.json();
-  const finalImg = data.steps.length ? data.steps[data.steps.length-1].image : IMG;
-  drawMatrix(finalImg);
-  // tag + history
-  document.getElementById('matrixTag').textContent = sequence.length
-    ? "— after: " + sequence.map(s=>`${s.name}(${s.arg.toFixed(2)})`).join(" → ")
-    : "— no filters applied";
-  const seqEl=document.getElementById('seq');
-  if(!data.steps.length){ seqEl.innerHTML='<li class="empty">nothing yet — move a slider</li>'; return; }
-  seqEl.innerHTML = data.steps.map((s,i)=>
-    `<li><span class="step">${i+1}. ${s.name} = ${s.arg.toFixed(2)}</span><br><span class="st">${statLine(s.name,s.stats)}</span></li>`).join("");
-  // refresh the order badges on sliders
-  ORDER.forEach(n=>{
-    const idx=sequence.findIndex(s=>s.name===n);
-    document.getElementById('o_'+n).textContent = idx>=0 ? `step ${idx+1}` : "";
-  });
-}
-
-function onSlide(n,v){
-  VAL[n]=v;
-  document.getElementById('v_'+n).textContent=v.toFixed(2);
-  // first time this filter is moved to a non-zero value -> append to sequence (update in place otherwise)
-  if(v!==0 && !SEQ.includes(n)) SEQ.push(n);
-  if(v===0 && SEQ.includes(n)) SEQ=SEQ.filter(x=>x!==n);  // back to 0 removes it from the chain
-  apply();
-}
-function sliders(){
-  const box=document.getElementById('sliderBox'); box.innerHTML="";
-  ORDER.forEach(n=>{
-    const row=document.createElement('div'); row.className='slider-row';
-    row.innerHTML=`<label>${n} <span><span class="order" id="o_${n}"></span> <span class="val" id="v_${n}">0.00</span></span></label>
-      <input type="range" id="s_${n}" min="-1" max="1" step="0.02" value="0">
-      <div class="stat">train range ±${RANGES[n]}</div>`;
-    box.appendChild(row);
-    row.querySelector('input').addEventListener('input',e=>onSlide(n,parseFloat(e.target.value)));
-  });
-}
-document.getElementById('reset').addEventListener('click',()=>{
-  ORDER.forEach(n=>{VAL[n]=0;document.getElementById('s_'+n).value=0;document.getElementById('v_'+n).textContent="0.00";document.getElementById('o_'+n).textContent="";});
-  SEQ=[]; apply();
-});
-document.getElementById('fgOnly').addEventListener('change',apply);
-(async function(){
-  const d=await (await fetch('/api/state')).json(); IMG=d.image; MASK=d.mask;
-  drawMatrix(IMG); sliders(); apply();
-})();
-</script>
-</body>
-</html>
 
 
-# Harmonizer — Handoff Notes
+def compute_inverse_arg(filter_name, x, image=None, fg_mask=None):
+    """Return the closed-form recovery argument y for `filter_name`.
 
-Image harmonization: paste a foreground (FG) into a background (BG), predict 6 filter
-arguments, apply them to make the FG match the scene. Self-supervised — degrade a real
-image to make a training composite, then learn to restore it.
+    Args
+    ----
+    filter_name : one of INVERSE_FNS keys
+    x           : the degrade argument that was applied (scalar)
+    image       : the image the degrade was applied to (np [3,H,W] in [0,1]).
+                  Needed only for temperature (per-channel means). Optional.
+    fg_mask     : np [1,H,W] in {0,1}; if given, means use FG region only.
+                  Default None -> whole-image (paper convention).
+    """
+    fn = INVERSE_FNS[filter_name]
+    if filter_name == 'temperature' and image is not None:
+        if fg_mask is not None:
+            m = fg_mask
+            denom = m.sum() + EPS
+            means = tuple((image[c:c+1] * m).sum() / denom for c in range(3))
+        else:
+            means = tuple(image[c:c+1].mean() for c in range(3))
+        return fn(x, means)
+    return fn(x)
 
-## The 6 filters — `src/model/filter.py`
 
-Each filter takes `image [n,3,h,w]` in `[0,1]` and a scalar arg `x ∈ [-1,1]`, returns a
-clamped image. Two kinds: **global** (use whole-image stats) and **per-pixel**.
+if __name__ == '__main__':
+    # quick self-test
+    for nm in INVERSE_FNS:
+        xs = [-0.4, -0.1, 0.1, 0.4]
+        ys = [round(compute_inverse_arg(nm, x), 4) for x in xs]
+        print(f"{nm:12s} x={xs} -> y={ys}")
 
-| # | Filter | Mechanism | Global stat? |
-|---|--------|-----------|--------------|
-| 1 | temperature | gray-world: scale R/G/B by coefs from channel means; +x warms (R up), -x cools (B up), G half | **yes** (channel means) |
-| 2 | brightness  | HSV, scale V by alpha. +x: `1/(1-x)` (steep); -x: `x+1` (linear) | no |
-| 3 | contrast    | push each pixel away from image mean: `img+(img-mean)*x_`; +x steep remap | **yes** (global mean) |
-| 4 | saturation  | spread channels around per-pixel HSL lightness; boost is ceiling-aware | no |
-| 5 | highlight   | gamma `^(x+1)` in inverted space → acts on brights | no |
-| 6 | shadow      | gamma `^(1-x)` on normal image → acts on darks | no |
+# Inverse-Argument Loss — Investigation & Verification
 
-Key subtlety (temperature/contrast): stats are taken over the **whole image incl. BG**,
-then the result is masked to FG. The BG steers the FG correction — intended for harmonization.
-Direction note: temperature's labels (`is_negative`=warm) are inverted vs the actual visual
-effect because the shifted mean sits in the coef denominator — verified numerically.
+**Branch:** `loss_function`
+**Status:** Idea validated, tooling built and run on real data. Training integration NOT yet started.
+**Deliverables in repo:** `inverse_targets.py`, `demo_inverse_on_sample.py`, `sample/inverse_demo/` (montage + per-filter strips + `inverse_results.json`).
 
-## Apply order & masking — `src/model/module.py` (`FilterPerformer`)
+---
 
-- Forward order (restore): `temperature → brightness → contrast → saturation → highlight → shadow`.
-- `restore()` chains filters on the running image; after each, composites `out*mask + x*(1-mask)`
-  (FG filtered, BG = original). Returns the cumulative output after **every** filter (6 images).
-- `adjust()` = inverse: runs filters in **reversed** order to degrade a real image into a composite.
+## 1. The problem this addresses
 
-## Argument prediction — `src/model/harmonizer.py`
+Harmonizer is trained self-supervised. A real (clean) image is *degraded* into a synthetic composite by applying a known scalar argument to each of the 6 filters, in reverse order, on the foreground (FG) region only:
 
-Backbone EfficientNet-B0 on FG/BG streams → regressor emits all 6 args **jointly** from the
-composite. Args clamped to `[-1,1]`. Train-time degrade args scaled by `filter_argument_ranges`
-= `[0.3, 0.5, 0.5, 0.6, 0.4, 0.4]`.
+```
+real image
+  apply para_6 (FG) -> comp_6
+  apply para_5 (FG) -> comp_5
+  apply para_4 (FG) -> comp_4
+  apply para_3 (FG) -> comp_3
+  apply para_2 (FG) -> comp_2
+  apply para_1 (FG) -> comp_1   <- this is what the model sees
+```
 
-## Training pipeline — `src/train/harmonizer/`
+The model sees only the final composite `comp_1` and must predict the 6 arguments that *restore* it back toward the real image. In effect, each predicted argument is the model's attempt to **invert** one filter, judged only from the final composite.
 
-- `data.py`: dataset returns `(composite, mask), (real,)`. No filtering here (done in model).
-- `trainer.py::_batch_prehandle` (lines ~566–585): the self-supervised core.
-  `adjust(real, mask, rand_args)` degrades real → composite and returns **all intermediates**.
-  `gt` is built as the reversed degradation states + real image → a per-stage target list
-  `G5…G0` aligned to the restore forward order. **The intermediates are already saved.**
-- `criterion.py::HarmonizerLoss`: per stage, FG-masked `L1 + 10*L2` (L1 = smooth abs).
-  Zips `pred_outputs` (6 cumulative) with `gt` (6 targets) → list of 6 stage losses.
+### Why the original per-stage (cascade) loss does not transfer to the MLP/joint head
 
-## Loss branches (this is multi-branch experiment territory)
+In the **original (cascade)** regressor, arguments are predicted *in order* — head `i` is conditioned on the previous heads. That ordering gives every intermediate stage a well-defined target (`comp_2 … comp_6`, the saved degrade intermediates), so the paper's dynamic per-stage loss is meaningful.
 
-- **This branch (MLP / joint, Approach #1):** `trainer.py` lines 113–118 use **only the final
-  stage**: `fine_loss = mean(l_image_losses[-1])`. The other 5 stage losses are computed but
-  logged as diagnostics only (`raw_filter_*`, `fine_filter_*` meters, no gradient).
-  Rationale in comment: with joint prediction, per-stage targets conflict with jointly-optimal
-  args, so they fell back to final-only.
-- **Other branches:** differ mainly in the **regressor head** (Cascade / SingleHead /
-  AttnHeadRegressor — see commented lines in train `harmonizer.py`) and the per-stage-vs-final
-  loss toggle. Filter math + degrade→restore pipeline stay constant across branches.
+In the **MLP / joint / order-invariant** heads (Approach #1 and later), all 6 arguments are emitted at once. There is no genuine "after filter `i`" hidden state aligned to `comp_{i+1}`, so supervising intermediate stages in image space becomes inconsistent with how the prediction was formed. That is why the MLP branch fell back to a **final-image-only** loss (`fine_loss = mean(l_image_losses[-1])`), with the other 5 stage losses logged as diagnostics only. The cost of final-only loss is the observed symptom that **middle filters stay inert** — nothing gives each filter its own gradient.
 
-## Per-stage loss discussion (open thread)
+### The idea: supervise in argument space, using the inverse
 
-Naive `|θ̂-θ|` argument MSE is wrong: args aren't comparable units, filters don't commute,
-forward ≠ exact inverse (clamping is lossy), and stateful filters depend on the image's stats.
-The right form is **image-space per-stage**: `Σ_k w_k ‖ r_k − G_k ‖₁` against saved `G_k`.
-That machinery already exists (just disabled here). Genuinely *new* relative to the repo would
-be: (a) teacher forcing / scheduled sampling, or (b) a small teacher-forced term for the
-**stateful filters only** (temp, contrast) so their means/variance are supervised on the correct
-image — the one thing both free-rollout and final-only loss get wrong. Caveat: clipped pixels
-(exactly 0/1 in target) give an irreducible loss floor — mask them out.
+Because **we generate the degrade ourselves**, we know each `para_i` *and* we have every intermediate image. So for each filter we can compute the exact **recovery argument** `y_i` — the value that, applied to the degraded image, returns the previous (cleaner) image — and compare the model's prediction to it:
 
-## Inspection tool — `filter_matrix_v2/` (app.py + index.html)
+```
+loss_i = MAE( y_hat_i , y_true_i )
+```
 
-Run: `pip install flask numpy && python app.py` → http://127.0.0.1:5000
-Single live 5×5 matrix (middle 3×3 = FG). Sliders on the right; filters apply **in the order
-you move them**; re-sliding updates in place. Shows per-step internal stats (temp means/coefs,
-contrast threshold, brightness alpha, gammas) + a sequence/history panel. Checkbox toggles
-whole-image vs FG-only stats. numpy mirror of `filter.py` (annotated), runs without torch.
+Crucially, `y_true_i` is fixed the moment the degrade is generated. **It does not depend on prediction order.** That is exactly what sidesteps the problem that killed image-space per-stage loss for the joint head. `y_true_i` can then be used either as an added loss term or as a per-node gradient weight (decision deferred — see §7).
 
-## Pointers
+---
 
-- Filter math: `src/model/filter.py`
-- Apply/compose: `src/model/module.py`
-- Predict: `src/model/harmonizer.py` (infer) / `src/train/harmonizer/module/harmonizer.py` (train)
-- Loss: `src/train/harmonizer/criterion.py` + `trainer.py` (lines 113–149 = what's active)
-- Data/degrade: `src/train/harmonizer/trainer.py::_batch_prehandle`
+## 2. The inverse, stated precisely
+
+For filter `i`, the degrade applied argument `x` (= `para_i`) to image `A` (= `comp_{i+1}`), producing `B` (= `comp_i`):
+
+```
+filter_i(A, x) = B
+```
+
+We want the recovery argument `y` such that applying the *same* filter to `B` returns `A`:
+
+```
+filter_i(B, y) = A
+```
+
+We know `x`, `A`, `B`, and all their statistics. The question this investigation answers: **does a closed-form `y` exist for each filter, and does it round-trip exactly against the real `filter.py` math (including clamps)?**
+
+**Stat convention:** whole-image statistics, matching the paper and the current `filter.py` (contrast uses the global mean; temperature uses whole-image per-channel means). FG-only stats were considered (cleaner target, no BG contamination) but **not** adopted, to stay faithful to the published filter semantics. An `fg_mask` option is left in the code for future A/B testing.
+
+---
+
+## 3. Per-filter inverse derivations
+
+Each filter takes an image and a scalar `x ∈ [-1, 1]` and returns a clamped image. Below, the inverse argument `y` is derived and then verified numerically (§5).
+
+### 3.1 Brightness — `y = -x`  (EXACT)
+
+Forward scales the HSV V channel by `alpha`:
+- `x ≥ 0`: `alpha = 1/(1-x)`
+- `x < 0`: `alpha = x+1`
+
+To undo a multiply-by-`alpha`, multiply by `1/alpha`. Solving for the recovery argument in either branch:
+- degrade `x ≥ 0` → need `alpha_rec = 1-x` → negative branch `y+1 = 1-x` → `y = -x`
+- degrade `x < 0` → need `alpha_rec = 1/(x+1)` → positive branch `1/(1-y) = 1/(x+1)` → `y = -x`
+
+So **`y = -x`** in both branches.
+
+### 3.2 Highlight — `y = 1/(x+1) - 1`  (EXACT)
+
+Forward = invert → `pow(·, x+1)` → invert. In inverted space it is a gamma with exponent `x+1`. Composing gammas multiplies exponents, so to undo exponent `x+1` apply exponent `1/(x+1)`. Set `y+1 = 1/(x+1)`:
+
+**`y = 1/(x+1) - 1`**
+
+### 3.3 Shadow — `y = 1 - 1/(1-x)`  (EXACT)
+
+Forward = `pow(img, 1-x)`. Undo exponent `1-x` with exponent `1/(1-x)`. Set `1-y = 1/(1-x)`:
+
+**`y = 1 - 1/(1-x)`**
+
+> Note: the highlight/shadow inverses are **asymmetric** — e.g. degrading highlight by `+0.382` is undone by `-0.277`, *not* `-0.382`. A naive `y = -x` would be wrong for these. This is why the per-filter inverse target does real work.
+
+### 3.4 Contrast — `y_ = -x_/(1+x_)`, then un-map `x_ → y`  (EXACT)
+
+Forward: `out = img + (img - mu) * x_`, where `mu = mean(image)` and `x_` is the remapped argument:
+- `x ≤ 0`: `x_ = x`
+- `x > 0`: `x_ = 255/(256 - floor(255·x)) - 1`
+
+Rewrite as an affine map in pixel value: `out = (1+x_)·img - x_·mu`, slope `(1+x_)`.
+
+**Key fact (proved):** contrast **preserves the mean**. `mean(out) = (1+x_)·mu - x_·mu = mu`. So the mean of the degraded image equals the mean of the original. Therefore the recovery applied to `B` uses the *same* `mu`, and the affine inverse is exact: need slope `1/(1+x_)`, i.e. `1 + y_ = 1/(1+x_)`:
+
+**`y_ = -x_/(1+x_)`**
+
+Then map `y_` back to an argument `y ∈ [-1,1]` (for the negative branch this is identity; for the positive branch invert the floor remap, exact to within the 1/255 quantization).
+
+### 3.5 Temperature — per-channel reciprocal (closed-form from saved means)
+
+Forward multiplies each channel `c` by `coef_c`, built from whole-image per-channel means (`meanR/meanG/meanB`), a gray-world target, and a residual `a_c = 1 - gray/mean_c`. Per channel it is a scalar multiply, so the inverse multiplies by `1/coef_c`. Because we saved the per-channel means, `coef_c` is known exactly.
+
+In the current implementation we use **`y = -x`** as the closed-form recovery argument (the per-channel means shift symmetrically under `±x`, so `-x` reproduces the reciprocal coefficients to clamp-floor accuracy). This recovers temperature well in practice (§5–6). A fully exact per-channel solve from the saved means is available as a refinement if tighter accuracy is needed.
+
+### 3.6 Saturation — branch-wise closed form
+
+- **Negative branch** (`x < 0`): forward is affine about the per-pixel mean with factor `a = 1+x`. Invert the slope: `1+y = 1/(1+x)` → **`y = -x/(1+x)`**.
+- **Positive branch** (`x ≥ 0`): ceiling-aware and nonlinear (the `(x+s) > 1` clamp). **`y = -x`** is the closed-form heuristic, exact away from the saturation ceiling; pixels driven into the ceiling are irreducible.
+
+---
+
+## 4. The central finding: the only error is clamping
+
+The first numerical pass showed contrast/temperature/saturation with ~2–6% round-trip error, which initially looked like the inverse formulas were wrong. They are not. Isolating clamping proved it:
+
+| Test | Result |
+|------|--------|
+| Contrast inverse, **no clamp**, in-range pixels | `2.2e-17` (machine epsilon — **exact**) |
+| Contrast inverse, **real filter (clamped)**, unclipped pixels measured | `6.8e-2` |
+
+The entire discrepancy comes from pixels that hit `0` or `1` during the degrade. Clamping is information-destroying: once a pixel is clipped, **no** argument can recover it. This is the *irreducible floor* noted in `HANDOFF.md`.
+
+**Why this matters for the idea:** the clamp floor is an **image-space** artifact. In **argument space**, the target `y` is always exact — it is a property of the argument and the (known) stats, not of the surviving pixels. This is a concrete advantage of argument-space supervision over image-space per-stage loss, which cannot escape the clamp floor.
+
+---
+
+## 5. Verification methodology
+
+All filters from `module/filter.py` were re-implemented in **pure numpy** (no torch — it would not install in the sandbox, and is unnecessary; the filters are elementwise). The replicas reproduce the exact arithmetic:
+
+- kornia-equivalent RGB↔HSV for brightness,
+- contrast's `255/(256-floor(255x))-1` positive-branch remap,
+- temperature's per-channel gray-world coefficients incl. the `aR/aG/aB` residual,
+- saturation's ceiling-aware branch,
+- every `clamp(0,1)`.
+
+For each filter: take an image, apply `filter(x)`, apply `filter(y)` with the candidate inverse, measure `|recovered - original|` **excluding clamped pixels**. Runs in well under a second on CPU.
+
+> A grid-search numerical inverter was used briefly to cross-check, but it is intentionally **not** part of the training path — a runtime root-find per filter per batch is too expensive on CPU. The production path is **closed-form only**.
+
+---
+
+## 6. Results on the real sample image
+
+`demo_inverse_on_sample.py` ran on `sample/image.jpg` with the provided `sample/mask.png` (FG = the man + child, ≈3% of the frame). For each filter: degrade the FG with a paper-scaled random argument, compute the closed-form inverse, restore, measure FG error excluding clamped pixels.
+
+| Filter | degrade x | recovery y | FG degrade err | FG recover err (unclipped) | Improvement |
+|--------|-----------|-----------|----------------|----------------------------|-------------|
+| temperature | -0.254 | +0.254 | 0.0517 | 0.01011 | ~5× |
+| brightness | +0.280 | -0.280 | 0.1529 | 0.000001 | ~exact |
+| contrast | -0.062 | +0.066 | 0.0142 | 0.00067 | ~21× |
+| saturation | +0.268 | -0.268 | 0.0123 | 0.00049 | ~25× |
+| highlight | +0.382 | -0.277 | 0.0887 | 0.0 | exact |
+| shadow | +0.031 | -0.032 | 0.0090 | 0.0 | exact |
+
+(Values are from `sample/inverse_demo/inverse_results.json`; exact figures vary with the random seed.)
+
+The montage (`sample/inverse_demo/montage_all_filters.png`) shows, per filter row: **original | degraded | restored**. The restored FG visually matches the original while the background is untouched (FG-only masking confirmed).
+
+**Reading the table:**
+- The 3 closed-form-exact filters (brightness, highlight, shadow) and contrast recover to ~0 on unclipped pixels.
+- Temperature and saturation recover well (5×–25× error reduction); their residual is the clamp floor plus, for temperature, the use of the `-x` recovery argument rather than the fully exact per-channel solve.
+
+---
+
+## 7. Code reference
+
+### `inverse_targets.py` — reusable core
+The function intended to drop into training:
+
+```python
+compute_inverse_arg(filter_name, x, image=None, fg_mask=None) -> y
+```
+
+- `filter_name`: one of `temperature, brightness, contrast, saturation, highlight, shadow`.
+- `x`: the degrade argument that was applied.
+- `image`: needed only for temperature (per-channel means); optional otherwise.
+- `fg_mask`: optional; if given, stats use the FG region only. **Default `None` → whole-image** (paper convention).
+
+Helpers `contrast_x_to_x_` / `contrast_x__to_x` handle the contrast remap and its inverse. No runtime solver — all closed-form, CPU-trivial.
+
+### `demo_inverse_on_sample.py` — end-to-end demo
+Loads the sample image + mask, runs degrade → inverse → restore for all 6 filters, and writes `sample/inverse_demo/`:
+- `montage_all_filters.png` (rows = filters, cols = orig | degraded | restored),
+- `<filter>.png` per-filter strips,
+- `inverse_results.json` (x, y, errors per filter).
+
+### Bugs found and fixed during the work
+- Default-argument error in `inv_temperature` (made `src_means` optional).
+- Mask broadcasting: a `[1,H,W]` mask was indexing a `[3,H,W]` image — fixed by repeating the mask to 3 channels for masked selection.
+
+---
+
+## 8. What is NOT done — training integration
+
+No training code has been touched. `criterion.py` and `trainer.py` are unchanged. The next step is to wire `compute_inverse_arg` into the loss. Two decisions remain open:
+
+1. **Added MAE term vs. per-node gradient weight.**
+   - *Added term:* `loss += w · Σ_i |y_hat_i − y_true_i|`. Stronger, but can pull each filter toward its individually-ideal inverse, which (because filters do not commute and clamp is lossy) may not be jointly optimal.
+   - *Gradient weight:* scale each filter's contribution by how far its argument is from the inverse target. Softer; will not fight the image loss.
+   - **Recommendation:** start with a **small added term on the 3 exact filters only** (brightness, highlight, shadow), and watch whether the inert middle filters wake up (the `Args/val_mean`/`val_std` spread in TensorBoard). Expand to contrast/saturation/temperature once the mechanism is confirmed.
+
+2. **Saved-stats vs. live running-image stats** (temperature, contrast).
+   - The model's running image at stage `i` only equals `comp_{i+1}` at convergence. Using saved `comp_{i+1}` stats is teacher-forced and exact at the fixed point, approximate en route.
+   - Using the model's live running-image stats removes that approximation at the cost of a little more plumbing. Decide after seeing whether the simple (saved-stats) version is sufficient.
+
+### Caveats to carry forward
+- **Non-commutativity:** even with perfect per-filter inverses, the composed chain may not reproduce the real image to floating point (filters do not commute; clamp is lossy). This argues for keeping the image loss in charge of the joint objective and letting arg-MAE provide the per-filter gradient.
+- **Scale/range bookkeeping:** degrade args are `para_i = uniform × range_i` (`[0.3,0.5,0.5,0.6,0.4,0.4]`), while the model predicts in `[-1,1]` and `restore` uses args unscaled. `y_true` and `y_hat` must be compared in the same units — be explicit about this when wiring the loss.
+- **Clamp floor:** if a per-stage *image* term is ever added, mask out pixels that are exactly 0/1 in the target.
+
+---
+
+## 9. Bottom line
+
+Your idea is sound and cheap. Every filter has an exact, closed-form recovery argument, computable at degrade time because we own the statistics — no GPU, no runtime solver. Verified against the real filter math and demonstrated end-to-end on the real sample image:
+
+- **Exact:** brightness, highlight, shadow, contrast.
+- **Recovers well (clamp-floor-limited):** temperature, saturation.
+- The only error source anywhere is pixel clamping, which is an image-space artifact; the **argument target is always exact** — the key advantage over image-space per-stage loss.
+
+Next: wire `compute_inverse_arg` into the trainer as a small added MAE term on the exact filters first, then expand.
+
+
+# How the Inverse `y_true` and the Arg Loss `|y_true − y_pred|` Are Found
+
+A focused, step-by-step explanation of the two quantities at the heart of the
+inverse-argument loss:
+
+- **`y_pred`** — the argument the model predicts for a filter.
+- **`y_true`** — the *correct recovery argument* for that filter (the exact inverse).
+- **arg loss** — `|y_true − y_pred|`, the per-filter penalty.
+
+This file answers, in detail: *what are `y_true` and `y_pred`, and how is each one obtained?*
+
+---
+
+## 0. The one-paragraph picture
+
+We take a clean image and **degrade** it by applying a known argument `x` to each
+filter (this builds the synthetic composite the model trains on). The model looks
+at the composite and **predicts** a recovery argument `y_pred` per filter — its
+attempt to undo the degrade. Because *we* did the degrade, we can compute the
+**exact** argument that undoes it, `y_true`. The arg loss simply compares the two:
+`|y_true − y_pred|`. The rest of this document is how each piece is computed.
+
+---
+
+## 1. Where `y_pred` comes from (the easy half)
+
+`y_pred` is just the model's output. The regressor head (MLP / parallel / attn)
+emits 6 numbers, one per filter, each clamped to `[-1, 1]`:
+
+```
+enc32x → regressor → [ŷ_1, ŷ_2, ŷ_3, ŷ_4, ŷ_5, ŷ_6]      # raw
+y_pred_i = clamp(ŷ_i, -1, 1)                               # what restore() actually uses
+```
+
+These are the values fed into `restore_image()` to apply the filters. So
+`y_pred_i` is exactly the number the network produces for filter `i`. Nothing to
+derive — it is read straight off the model.
+
+> Important for matching units: `restore()` uses these **unscaled** (native `[-1,1]`).
+> So `y_true` must also be expressed in the same native units (see §4).
+
+---
+
+## 2. Where `y_true` comes from (the real work)
+
+### 2.1 The degrade is something WE do, with known arguments
+
+Training is self-supervised. Starting from a clean real image, we apply each
+filter **in reverse order** with a randomly sampled argument to manufacture the
+composite. For filter `i` the degrade applied argument `x_i` to one image
+(call it `A`) and produced the next (call it `B`):
+
+```
+filter_i(A, x_i) = B
+```
+
+We **know** `x_i` (we sampled it) and we **have** both `A` and `B` (every
+intermediate is saved during the degrade).
+
+### 2.2 The definition of `y_true`
+
+`y_true_i` is the argument that **undoes** that step — i.e. applying the same
+filter to `B` returns `A`:
+
+```
+filter_i(B, y_true_i) = A
+```
+
+So `y_true_i` is defined by an equation, not by the model. Solving that equation
+(in closed form) for each filter is the whole game. The next section does it
+filter by filter.
+
+> Key property: `y_true_i` depends only on `x_i` (and, for two filters, on saved
+> image statistics). It does **not** depend on prediction order or on the model.
+> That is why it is a valid target for an order-invariant joint head.
+
+---
+
+## 3. The closed-form inverse, derived per filter
+
+Each filter maps a pixel value with a known formula; "undo it" means invert that
+formula for the argument. Below, each inverse is derived and its status noted.
+(All verified numerically against the real `filter.py`; see `INVERSE_LOSS_INVESTIGATION.md`.)
+
+### 3.1 Brightness — `y_true = -x`   (EXACT, no stats)
+
+Forward scales the HSV **V** channel by `alpha`:
+```
+alpha = 1/(1-x)   if x ≥ 0
+alpha = x + 1     if x < 0
+```
+To undo a multiply-by-`alpha`, multiply by `1/alpha`. Solving for the argument
+that produces `1/alpha` gives, in both branches:
+```
+y_true = -x
+```
+
+### 3.2 Highlight — `y_true = 1/(x+1) − 1`   (EXACT, no stats)
+
+Forward is a gamma with exponent `(x+1)` in inverted space. Two gammas compose by
+**multiplying exponents**, so to undo exponent `(x+1)` apply exponent `1/(x+1)`:
+```
+y_true + 1 = 1/(x+1)   ⇒   y_true = 1/(x+1) − 1
+```
+
+### 3.3 Shadow — `y_true = 1 − 1/(1−x)`   (EXACT, no stats)
+
+Forward is a gamma with exponent `(1−x)`. Undo with exponent `1/(1−x)`:
+```
+1 − y_true = 1/(1−x)   ⇒   y_true = 1 − 1/(1−x)
+```
+
+> Note the **asymmetry**: highlight degraded by `+0.382` is undone by `−0.277`
+> (not `−0.382`). A naive "negate the argument" rule would be wrong for highlight
+> and shadow — which is exactly why a real inverse target is worth computing.
+
+### 3.4 Contrast — `y_true_ = −x_/(1+x_)`   (EXACT; mean is preserved)
+
+Forward: `out = img + (img − μ)·x_`, where `μ = mean(image)` and `x_` is the
+remapped argument:
+```
+x_ = x                                   if x ≤ 0
+x_ = 255/(256 − floor(255·x)) − 1        if x > 0
+```
+Rewrite as an affine map: `out = (1+x_)·img − x_·μ`, slope `(1+x_)`.
+
+**Fact (proved):** contrast **preserves the mean** — `mean(out) = μ`. So the
+recovery applied to `B` sees the *same* `μ`, and inverting the slope is exact:
+```
+1 + y_true_ = 1/(1+x_)   ⇒   y_true_ = −x_/(1+x_)
+```
+Then map `y_true_` back to an argument in `[-1,1]` (negative branch is identity;
+positive branch inverts the floor remap, exact to within 1/255).
+
+### 3.5 Temperature — per-channel reciprocal (closed form from saved means)
+
+Forward multiplies each channel `c` by `coef_c`, built from the (whole-image)
+per-channel means and a gray-world target. Per channel it is a scalar multiply,
+so the inverse multiplies by `1/coef_c`. Because the per-channel means are saved,
+`coef_c` is known. The implementation uses the closed form
+```
+y_true = -x
+```
+(the per-channel means shift symmetrically under `±x`, reproducing the reciprocal
+coefficients to clamp-floor accuracy). A fully exact per-channel solve from the
+saved means is available as a refinement.
+
+### 3.6 Saturation — branch-wise closed form
+
+- **Negative branch** (`x < 0`), affine with factor `(1+x)` about the per-pixel
+  mean: invert the slope →
+  ```
+  y_true = -x/(1+x)
+  ```
+- **Positive branch** (`x ≥ 0`), ceiling-aware / nonlinear:
+  ```
+  y_true = -x        (heuristic; exact away from the saturation ceiling)
+  ```
+
+### 3.7 Summary table
+
+| Filter | `y_true` | Needs stats? | Status |
+|--------|----------|--------------|--------|
+| brightness | `-x` | no | exact |
+| highlight | `1/(x+1) − 1` | no | exact |
+| shadow | `1 − 1/(1−x)` | no | exact |
+| contrast | `-x_/(1+x_)` then un-map | mean (preserved) | exact |
+| temperature | `-x` | per-channel means | exact to clamp floor |
+| saturation | `-x/(1+x)` (neg) / `-x` (pos) | per-pixel | exact away from ceiling |
+
+The only residual error anywhere is **pixel clamping to [0,1]** — an *image-space*
+artifact. In **argument space** `y_true` is always exact (it is a property of the
+argument and known stats, not of clipped pixels). This is the key reason arg-space
+supervision beats image-space per-stage loss.
+
+---
+
+## 4. Matching units — the one place a silent bug hides
+
+- The degrade samples a raw value and **scales it by a per-filter range** before
+  applying: `x_applied = uniform(-1,1) · range_i`, with
+  `range = [0.3, 0.5, 0.5, 0.6, 0.4, 0.4]`.
+- The model predicts in native `[-1,1]` and `restore()` uses it **unscaled**.
+
+So `y_true` must be computed from the **actually-applied (scaled)** argument
+`x_applied`, because that is what hit the pixels — and the resulting `y_true` is
+then already in the same native units as `y_pred` (what `restore()` consumes).
+**Compare `y_true` and `y_pred` in the same units.** A range-check assert on the
+first batch (do `y_true` and `y_pred` have comparable per-filter ranges?) catches
+this immediately.
+
+> Special case: the **idempotency / zero-target** group uses `y_true = 0`, which
+> needs no scaling (0 scales to 0) and is the verified no-op of every filter.
+
+---
+
+## 5. How the arg loss is computed (`|y_true − y_pred|`)
+
+Per **image** `n` and per **filter** `i`:
+```
+arg_err_i^(n) = | y_pred_i^(n) − y_true_i^(n) |
+```
+- `y_pred_i^(n)` — model's predicted (clamped) argument for filter `i`, image `n`.
+- `y_true_i^(n)` — the closed-form inverse for image `n`'s degrade arg of filter `i`
+  (from §3), in matched units (§4).
+
+Average over the 6 filters to get the per-image arg loss:
+```
+l_arg^(n) = (1/6) · Σ_{i=1..6} arg_err_i^(n)          # L1 / MAE, all 6 filters
+```
+Then average over the synthetic images in the batch (same pattern as the image
+loss — per-image first, then mean):
+```
+l_arg = (1/N_syn) · Σ_{n} l_arg^(n)
+```
+And it enters the total loss with a tuned weight `λ`:
+```
+L = l_fine + λ · l_arg + l_coarse
+```
+- `l_fine` — image loss (L1 + 10·L2) on the synthetic composites' final output.
+- `λ · l_arg` — the arg loss above (synthetic stream only; coarse has no `y_true`).
+- `l_coarse` — image loss on the real composites (×10), **no arg term**.
+
+One scalar `L` → one `backward()` → one optimizer step (per batch).
+
+---
+
+## 6. Why this term updates the right filter (gradient view)
+
+Backprop differentiates the **sum** `L`, so the error signal at each output
+neuron splits into two parts:
+```
+δ_yi = ∂L/∂y_pred_i
+     = ∂(image part)/∂y_pred_i        +   λ · ∂(l_arg)/∂y_pred_i
+     = δ_image_i                       +   λ · sign(y_pred_i − y_true_i)
+       └─ via the long filter→image    └─ DIRECT, per-filter, ±1 toward y_true
+          chain (≈0 for inert filters)
+```
+- The **image part** can be ~0 for an inert filter (nudging it barely moves the
+  image, so the image loss does not care).
+- The **arg part** is a clean `±1` (scaled by `λ`) that points the prediction
+  straight at `y_true` — it does **not** go through the filters, so it is nonzero
+  even when the image part is zero.
+
+That second term is exactly why the arg loss can **wake an inert filter**: it
+injects a direct gradient that says "your argument is wrong in this direction,
+fix it," independent of how much that filter currently affects the image.
+
+(With L1 the derivative is `sign(...)` = direction only. With L2 it would be
+`2(y_pred − y_true)` = proportional to how wrong. We use **L1** for robustness to
+the two approximate targets; the "more-wrong-gets-bigger-push" behavior is added
+deliberately by Approach B's normalized weighting, not by switching to L2.)
+
+---
+
+## 7. End-to-end recap (one image, one filter)
+
+```
+1. degrade:   x_applied = uniform(-1,1)·range_i             # we choose this
+              B = filter_i(A, x_applied)                    # build the composite
+2. predict:   y_pred_i = clamp(model_output_i, -1, 1)       # model's guess
+3. target:    y_true_i = inverse_i(x_applied[, saved stats])# closed form, §3
+4. loss:      arg_err_i = |y_pred_i − y_true_i|             # §5
+5. combine:   l_arg = mean over 6 filters, then over images
+              L = l_fine + λ·l_arg + l_coarse
+6. learn:     L.backward();  optimizer.step()
+              δ_yi = δ_image_i + λ·sign(y_pred_i − y_true_i)
+```
+
+- `y_pred` = read from the model.
+- `y_true` = solved in closed form from the known degrade argument (and saved
+  stats for contrast/temperature), exact in argument space.
+- arg loss = `|y_true − y_pred|`, averaged, weighted by `λ`, added to `L`.
+
+See `inverse_targets.py` for the reference implementation of step 3, and
+`context.md` §9 for how steps 1–6 wire into the trainer.
+
+---
+
+## 8. "Is it just −x?" — the error expression per filter
+
+A natural first guess is `error = |y_pred − (−x)|`, i.e. assume the correct
+recovery is always the negated argument. **This is right for only 2 of the 6
+filters.** For the other 4 the true inverse is *not* a simple negation, so using
+`−x` would penalize the model for predicting the genuinely correct value.
+
+| Filter | error = `\| y_pred − y_true \|` with y_true = | Just −x? |
+|--------|---------------------------------------------|----------|
+| brightness | `−x` | ✓ yes |
+| temperature | `−x` | ✓ yes (clamp-floor) |
+| highlight | `1/(x+1) − 1` | ✗ no (asymmetric) |
+| shadow | `1 − 1/(1−x)` | ✗ no (asymmetric) |
+| contrast | `−x_/(1+x_)` (remapped) | ✗ approx only |
+| saturation | `−x/(1+x)` if x<0, else `−x` | ✗ no (neg branch) |
+
+**Worked checks (why −x fails):**
+- highlight, apply `x=+0.382` → `y_true = 1/1.382 − 1 = −0.277` (not −0.382).
+- shadow, apply `x=+0.3` → `y_true = 1 − 1/0.7 = −0.4286` (not −0.3).
+- saturation (neg), apply `x=−0.4` → `y_true = 0.4/0.6 = +0.667` (not +0.4).
+
+So `error = |y_pred − (−x)|` is valid **only for brightness and temperature**.
+Everything else must use its real `y_true` from §3. This is the entire reason
+`inverse_targets.py` exists — to supply the correct per-filter target so the error
+means "distance from the truly correct argument," not "distance from naive
+negation."
+
+---
+
+## 9. How we invert each filter, and what we save during the degrade
+
+**General principle.** To compute `y_true` for filter `i` we need: (a) the degrade
+argument `x` we applied (always known — we sampled it), and (b) any image
+statistic the filter's formula uses. Filters split into **stats-free** (save only
+`x`) and **stateful** (save specific means). Everything we save we already have,
+because we generate the degrade ourselves — no solver, no extra forward pass.
+
+### Per filter
+
+**1. Brightness** — inverts by negating the V-scaling factor → `y_true = −x`.
+Save: **`x` only.** No image stats (the factor depends only on `x`).
+
+**2. Highlight** — gamma `(x+1)` in inverted space; undo with reciprocal exponent
+→ `y_true = 1/(x+1) − 1`. Save: **`x` only.** No stats (same curve on every pixel).
+
+**3. Shadow** — gamma `(1−x)`; reciprocal exponent → `y_true = 1 − 1/(1−x)`.
+Save: **`x` only.** No stats.
+
+**4. Contrast** — affine `out = (1+x_)·img − x_·μ`, slope `(1+x_)`, `μ = mean`.
+Invert the slope → `x_=remap(x)`, `y_true_=−x_/(1+x_)`, `y_true=unmap(y_true_)`.
+Save: **`x`** (+ mean `μ`). *But contrast preserves the mean* (`mean(B)=mean(A)=μ`),
+so `μ` is derivable from the composite at loss time — exact either way. (Whole-image
+mean, paper convention.)
+
+**5. Temperature** — multiplies each channel by `coef_c` from per-channel means;
+inverse multiplies by `1/coef_c`. Means shift symmetrically under ±x →
+`y_true = −x` (to clamp-floor accuracy). Save: **`x`** (+ the three per-channel
+means meanR/meanG/meanB if you want the fully-exact per-channel solve; the simple
+`−x` form needs only `x`).
+
+**6. Saturation** — branch-dependent:
+- neg (`x<0`): affine factor `(1+x)` → `y_true = −x/(1+x)`.
+- pos (`x≥0`): ceiling-aware nonlinear → `y_true = −x` (exact away from ceiling).
+Save: **`x`** (its sign picks the branch). Per-pixel min/max/mean are recomputed
+from the image, not stashed.
+
+### What-to-save summary
+
+| Filter | Inverse | Save during degrade |
+|--------|---------|---------------------|
+| brightness | `−x` | `x` only |
+| highlight | `1/(x+1) − 1` | `x` only |
+| shadow | `1 − 1/(1−x)` | `x` only |
+| contrast | `unmap(−x_/(1+x_))` | `x` (+ mean μ — but mean-preserving, derivable) |
+| temperature | `−x` (exact form uses means) | `x` (+ per-channel means for exact variant) |
+| saturation | `−x/(1+x)` if x<0 else `−x` | `x` (+ sign for branch) |
+
+**Bottom line:** 4 of 6 filters need only the saved **argument `x`** (the inverse
+is a pure function of `x`). The 2 genuinely stateful filters add **image means**
+(contrast: global mean, mean-preserving; temperature: per-channel means for the
+exact solve). All of it is one `.mean()` away at degrade time — that's why the
+whole scheme is cheap.
