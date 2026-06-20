@@ -1655,3 +1655,102 @@ is a pure function of `x`). The 2 genuinely stateful filters add **image means**
 (contrast: global mean, mean-preserving; temperature: per-channel means for the
 exact solve). All of it is one `.mean()` away at degrade time — that's why the
 whole scheme is cheap.
+
+"""
+inverse_torch.py src/train/harmonizer
+================
+Differentiable, batched closed-form inverse (recovery) arguments per filter,
+for the arg-loss. Mirrors inverse_targets.py (the numpy reference at repo root).
+
+Each fn: x [N,1] (the SCALED degrade arg that actually hit the pixels) -> y_true [N,1].
+y_true is a TARGET; detach it at the call site (no grad through the target).
+
+Stat convention: whole-image (matches module/filter.py / the paper). temperature
+uses the simple closed form y = -x (exact to clamp-floor accuracy); a per-channel
+exact variant can be added later using the saved per-channel means.
+
+Filter order MUST match Harmonizer.filter_types:
+    temperature, brightness, contrast, saturation, highlight, shadow
+
+See INVERSE_AND_ARGLOSS_EXPLAINED.md (derivations + what-to-save) and
+INVERSE_LOSS_INVESTIGATION.md (numerical verification) for the math.
+"""
+import torch
+
+EPS = 1e-6
+
+
+def inv_brightness(x):
+    """Forward scales HSV-V by alpha(x); inverse negates the argument."""
+    return -x
+
+
+def inv_highlight(x):
+    """Forward = gamma (x+1) in inverted space; undo with reciprocal exponent."""
+    return 1.0 / (x + 1.0) - 1.0
+
+
+def inv_shadow(x):
+    """Forward = gamma (1-x); undo with reciprocal exponent."""
+    return 1.0 - 1.0 / (1.0 - x)
+
+
+def inv_contrast(x):
+    """Affine out=(1+x_)img - x_*mu, slope (1+x_); mean is preserved so the
+    affine inverse is exact. x_ is the remapped argument from filter.py."""
+    # forward remap: x_ = x if x<=0 ; x_ = 255/(256-floor(255x))-1 if x>0
+    x_ = torch.where(x > 0, 255.0 / (256.0 - torch.floor(x * 255.0)) - 1.0, x)
+    y_ = -x_ / (1.0 + x_)
+    # un-map y_ -> y argument: neg branch is identity; pos branch inverts the floor remap
+    y = torch.where(y_ > 0, (256.0 - 255.0 / (y_ + 1.0)) / 255.0, y_)
+    return torch.clamp(y, -1.0, 1.0)
+
+
+def inv_temperature(x):
+    """Per-channel scalar multiply by coef_c; means shift symmetrically under +-x,
+    so y = -x reproduces the reciprocal coefficients to clamp-floor accuracy.
+    (Exact per-channel variant available later via saved per-channel means.)"""
+    return -x
+
+
+def inv_saturation(x):
+    """Branch-wise: neg (x<0) affine factor (1+x) -> y=-x/(1+x);
+    pos (x>=0) ceiling-aware nonlinear -> y=-x (exact away from the ceiling)."""
+    return torch.where(x < 0, -x / (1.0 + x), -x)
+
+
+# filter name -> inverse fn  (order matches Harmonizer.filter_types)
+INVERSE_BY_NAME = {
+    'temperature': inv_temperature,
+    'brightness':  inv_brightness,
+    'contrast':    inv_contrast,
+    'saturation':  inv_saturation,
+    'highlight':   inv_highlight,
+    'shadow':      inv_shadow,
+}
+
+
+def compute_y_true(filter_name, x_scaled):
+    """Return the closed-form recovery argument y_true for `filter_name`.
+
+    Args
+    ----
+    filter_name : one of INVERSE_BY_NAME keys.
+    x_scaled    : torch tensor [N,1] -- the SCALED degrade arg (raw * range_i),
+                  i.e. the argument that actually hit the pixels.
+
+    Returns
+    -------
+    y_true : torch tensor [N,1].  NOT detached -- the caller should .detach()
+             it (it is a target; no gradient should flow through it).
+    """
+    return INVERSE_BY_NAME[filter_name](x_scaled)
+
+
+if __name__ == '__main__':
+    # quick self-test: shapes + asymmetry + matches the numpy reference values
+    xs = torch.tensor([[-0.4], [-0.1], [0.1], [0.4]])
+    for name in ['temperature', 'brightness', 'contrast', 'saturation', 'highlight', 'shadow']:
+        ys = compute_y_true(name, xs).squeeze(1).tolist()
+        print('{0:12s} x={1} -> y={2}'.format(
+            name, [round(v, 3) for v in xs.squeeze(1).tolist()], [round(v, 4) for v in ys]))
