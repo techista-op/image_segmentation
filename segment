@@ -1754,3 +1754,234 @@ if __name__ == '__main__':
         ys = compute_y_true(name, xs).squeeze(1).tolist()
         print('{0:12s} x={1} -> y={2}'.format(
             name, [round(v, 3) for v in xs.squeeze(1).tolist()], [round(v, 4) for v in ys]))
+
+
+
+So: start λ = 0.1 (or, better, measure l_arg first and set λ ≈ 0.3·l_fine/l_arg), aim for the arg term at ~5–10% of total loss / ~20–50% of l_fine, and treat λ ∈ {0.1, 0.3, 0.5} as the sweep if filters don't wake at 0.1. The 80/20 coarse dominance is the reason I'd lean toward the higher end of the sweep if the first run looks inert.
+
+
+
+# logging.md — What to Log in TensorBoard to Inspect the Arg-Loss
+
+Goal: be able to answer, from TensorBoard alone, **"is the inverse-argument loss
+actually doing what we think?"** — i.e. is it waking the inert filters, is λ in a
+sane range, is it helping or hurting harmonization, and (for the idempotency run)
+is it curing drift without collapsing.
+
+This builds on what the trainer **already logs** (don't duplicate those); it adds
+the arg-loss-specific signals and tells you what each one should look like.
+
+---
+
+## 0. What's ALREADY logged (watch these, no code needed)
+
+From `trainer.py` (per-epoch):
+- `Loss/train_filter_{i}_{name}`, `Loss/raw_filter_{i}_{name}` — per-stage image losses (diagnostic).
+- `Loss/val`, `Metrics/MSE`, `Metrics/fMSE`, `Metrics/PSNR`, `Metrics/SSIM` — quality metrics.
+- `Args/val_mean_{i}_{name}`, `Args/val_std_{i}_{name}`, `Args/val_hist_{i}_{name}` — **per-filter predicted argument stats** (every 5 epochs). **This is the primary "did the filters wake up" signal.**
+- `Grad/backbone_norm`, `Grad/regressor_norm`, `Grad/regressor_backbone_ratio`, `Grad/regressor_{fc1,fc2,out,pool}_norm` — gradient norms.
+- `Metrics/harmony_gain`, `Metrics/harmony_gain_mse` — output-vs-input FG error ratio.
+- `Images/comparison_grid` — visual (comp | gt | output | diff) per subset, every 5 epochs.
+
+These already cover the **quality guardrail** (MSE/fMSE/PSNR/SSIM) and the
+**wake-up signal** (Args spread). The new logging below is about the **arg-loss
+itself** and a few targeted diagnostics.
+
+---
+
+## 1. NEW scalars to add (the arg-loss core)
+
+Add these in `_train` where the arg loss is built, and flush them per-epoch in the
+existing per-epoch logging block (lines ~209–251). Group them under `Arg/` so they
+sit together in TensorBoard.
+
+### 1.1 The loss terms themselves (MOST IMPORTANT for setting λ)
+```
+Arg/l_fine            # the image loss (fine stream) — already have as fine_loss
+Arg/l_arg             # the raw (unweighted) arg loss, mean over 6 filters
+Arg/l_arg_weighted    # lambda * l_arg  (what actually enters L)
+Arg/lambda            # the current lambda (constant, but log it so runs are self-describing)
+Arg/ratio_arg_to_fine # l_arg_weighted / (l_fine + eps)
+```
+**Why:** `Arg/ratio_arg_to_fine` is how you judge λ. If it's ~0.001, the arg loss
+is negligible (λ too small / wrong scale); if it's ~10, it's drowning the image
+loss (λ too big). A healthy assist is roughly **0.05–0.5**. Tune λ to land there.
+
+### 1.2 Per-filter arg error (the wake-up diagnostic in ARG space)
+```
+Arg/err_{i}_{name}    # mean |y_pred_i - y_true_i| per filter, e.g. Arg/err_0_temperature
+```
+**Why:** this is the cleanest per-filter health check. For the **3 exact filters**
+(brightness, highlight, shadow) this should drop toward ~0 if the model is
+learning the inverse. If a filter's `Arg/err` stays flat and high, that filter is
+NOT learning its argument — exactly the inert-filter symptom, now visible directly.
+
+### 1.3 Predicted vs true argument, per filter (is it tracking the target?)
+```
+Arg/pred_mean_{i}_{name}   # mean predicted arg this epoch (train)
+Arg/true_mean_{i}_{name}   # mean true (inverse) arg this epoch
+```
+**Why:** plotting these two together per filter shows whether `y_pred` is
+converging toward `y_true`. If `pred` is stuck near 0 while `true` varies, the
+filter is predicting "do nothing" regardless — inert. (Note: `true_mean` over a
+batch of random degrades will hover near 0 by symmetry; the useful view is the
+*correlation/spread*, see §1.4.)
+
+### 1.4 Per-filter pred-vs-true correlation (the BEST single wake-up number)
+```
+Arg/corr_{i}_{name}        # Pearson corr between y_pred_i and y_true_i over the batch
+```
+**Why:** mean args are ~0 by symmetry, so means alone are misleading. **Correlation
+is the real signal:** if the model predicts the right argument *per image*, corr → 1.
+A flat corr ≈ 0 means the filter ignores the input (inert) even if its mean looks
+fine. This is the most informative arg-space diagnostic — add it if you add nothing
+else from §1.3.
+
+---
+
+## 2. NEW scalars for Approach B (normalized weighting)
+
+Only for the B runs. Log the per-filter weights so you can see the normalization
+working.
+```
+ArgB/weight_{i}_{name}     # the detached w_i used this step (err_i / ema_i)
+ArgB/ema_{i}_{name}        # the running EMA of each filter's error
+```
+**Why:** confirms B is doing its job. A lagging filter should show `weight > 1`
+(getting boosted) and a well-learned one `weight < 1`. If all weights sit at ~1
+forever, B is behaving like A (no differentiation) — either fine or a sign the
+EMA decay is off. Watch for weights exploding (EMA cold-start instability) early on.
+
+---
+
+## 3. NEW scalars for the idempotency / zero-target run
+
+Only for the parallel-head + A + idempotency run.
+```
+Idem/loss                  # the zero-target arg loss on undegraded real images
+Idem/pred_absmean_{i}_{name}   # mean |predicted arg| on the real (already-correct) images
+```
+**Why:** `Idem/pred_absmean_*` should **decrease toward 0** — the model learning to
+leave correct images alone. That is the anti-drift property being learned.
+
+### The CRITICAL guardrail (collapse check)
+You must distinguish "args → 0 on correct images (good)" from "args → 0 on
+everything (collapse, bad)". So log the argument magnitude on **composites**
+separately from **real images**:
+```
+Idem/composite_arg_absmean   # mean |arg| on disharmonious composites (should stay NONZERO)
+Idem/real_arg_absmean        # mean |arg| on undegraded real images (should go to ~0)
+```
+**Success = these two SEPARATE:** `real → 0` while `composite` stays nonzero. If
+**both** collapse to 0, the idempotency term is too strong → lower `idem_weight`.
+Plot them on the same chart; their *gap* is the success signal.
+
+---
+
+## 4. What "working" looks like — a checklist by signal
+
+| Signal | Working (arg-loss helping) | Not working / problem |
+|--------|----------------------------|------------------------|
+| `Arg/ratio_arg_to_fine` | settles in ~0.05–0.5 | ~0 (λ too small) or ≫1 (λ drowns image loss) |
+| `Arg/err_*` (exact filters) | drop toward ~0 | flat & high → filter not learning its arg |
+| `Arg/corr_*` | rise toward 1 | stuck ~0 → filter ignores input (inert) |
+| `Args/val_std_*` (existing) | inert middle filters gain non-trivial spread | middle filters stay flat/near-0 |
+| `Metrics/fMSE`, `PSNR` | hold near / beat baseline | degrade vs OFF baseline → arg-loss hurting |
+| `ArgB/weight_*` (B only) | lagging filters >1, learned <1 | all ~1 (no effect) or exploding (EMA unstable) |
+| `Idem/real_arg_absmean` | → 0 | stays high → drift not cured |
+| `Idem/composite_arg_absmean` | stays nonzero | → 0 too = collapse, lower idem_weight |
+
+**The single most important comparison:** overlay this run's `Metrics/fMSE` (and
+`Args/val_std_*`) against the **existing OFF baseline** for the same architecture.
+The headline question — "does the arg loss help over base?" — is answered by:
+*do the inert filters wake up (Args spread up, Arg/corr up) WHILE fMSE/PSNR hold or
+improve?* If filters wake but quality drops, λ is too high. If quality holds but
+filters stay flat, λ is too low (or the arg loss isn't reaching them).
+
+---
+
+## 5. Code: where and how to log (snippets)
+
+### 5.1 In `_train`, where the arg loss is built (per-batch → meters)
+After computing per-filter `err_i` (the §3/§4 loss block in `coding.md`):
+```python
+# raw + weighted arg loss
+self.meters.update('arg_l_arg', float(l_arg.detach()))
+self.meters.update('arg_l_arg_weighted', float((lam * l_arg).detach()))
+# per-filter err + correlation (synthetic batch)
+for i, fname in enumerate(self.filter_names):
+    if fname not in sup: continue
+    yp = torch.clamp(y_pred_all[i][:lbs], -1, 1).detach().view(-1)
+    yt = compute_y_true(fname, x_scaled[i]).detach().view(-1)
+    self.meters.update('arg_err_{0}_{1}'.format(i, fname), float(torch.mean(torch.abs(yp - yt))))
+    # Pearson corr (guard against zero variance)
+    if yp.std() > 1e-6 and yt.std() > 1e-6:
+        corr = float(((yp - yp.mean()) * (yt - yt.mean())).mean() / (yp.std() * yt.std() + 1e-6))
+    else:
+        corr = 0.0
+    self.meters.update('arg_corr_{0}_{1}'.format(i, fname), corr)
+    self.meters.update('arg_predmean_{0}_{1}'.format(i, fname), float(yp.mean()))
+    self.meters.update('arg_truemean_{0}_{1}'.format(i, fname), float(yt.mean()))
+```
+
+### 5.2 In the per-epoch logging block (~lines 209–251), flush to TensorBoard
+```python
+step = epoch + 1
+if 'arg_l_arg' in self.meters.keys():
+    self.writer.add_scalar('Arg/l_arg', self.meters['arg_l_arg'].avg, step)
+    self.writer.add_scalar('Arg/l_arg_weighted', self.meters['arg_l_arg_weighted'].avg, step)
+    self.writer.add_scalar('Arg/lambda', self.args.arg_loss_weight, step)
+    fine = self.meters['fine_filter_{0}_loss'.format(len(self.filter_names)-1)].avg \
+        if 'fine_filter_{0}_loss'.format(len(self.filter_names)-1) in self.meters.keys() else \
+        self.meters.get('input_mse', None)
+    # ratio: weighted arg loss vs the fine image loss
+    if 'input_fg_mse' in self.meters.keys() and self.meters['input_fg_mse'].avg > 1e-9:
+        self.writer.add_scalar('Arg/ratio_arg_to_fine',
+            self.meters['arg_l_arg_weighted'].avg / (self.meters['output_fg_mse'].avg + 1e-9), step)
+for i, fname in enumerate(self.filter_names):
+    for key, tag in [('arg_err', 'Arg/err'), ('arg_corr', 'Arg/corr'),
+                     ('arg_predmean', 'Arg/pred_mean'), ('arg_truemean', 'Arg/true_mean')]:
+        mk = '{0}_{1}_{2}'.format(key, i, fname)
+        if mk in self.meters.keys():
+            self.writer.add_scalar('{0}_{1}_{2}'.format(tag, i, fname), self.meters[mk].avg, step)
+```
+
+### 5.3 Approach B weights (in the B loss block)
+```python
+self.meters.update('argB_weight_{0}_{1}'.format(i, fname), float(w_i))
+self.meters.update('argB_ema_{0}_{1}'.format(i, fname), float(self._arg_ema[fname]))
+# ...and flush analogously under 'ArgB/weight_*' and 'ArgB/ema_*' in the epoch block.
+```
+
+### 5.4 Idempotency (in the idem block)
+```python
+self.meters.update('idem_loss', float(l_idem.detach()))
+self.meters.update('idem_real_absmean', float(torch.mean(torch.stack(
+    [torch.mean(torch.abs(torch.clamp(idem_args[i], -1, 1))) for i in range(len(self.filter_names))]))))
+# composite arg magnitude: reuse y_pred_all on the synthetic/coarse (disharmonious) part
+self.meters.update('idem_comp_absmean', float(torch.mean(torch.stack(
+    [torch.mean(torch.abs(torch.clamp(y_pred_all[i][:lbs], -1, 1))) for i in range(len(self.filter_names))]))))
+# flush under Idem/loss, Idem/real_arg_absmean, Idem/composite_arg_absmean
+```
+
+---
+
+## 6. Minimal vs full logging
+
+If you want the **smallest set** that still answers "is it working":
+1. `Arg/ratio_arg_to_fine` — is λ sane?
+2. `Arg/corr_{i}` for all 6 — are the filters learning their arguments? (the key)
+3. existing `Metrics/fMSE` + `Args/val_std_*` vs the OFF baseline — wake-up without quality loss?
+4. (idem run only) `Idem/real_arg_absmean` vs `Idem/composite_arg_absmean` — cured without collapse?
+
+Everything else in §1–§3 is for deeper diagnosis when something looks off.
+
+---
+
+## 7. One-line summary
+Log the arg loss and its **ratio to the image loss** (to set λ), the **per-filter
+arg error and pred-vs-true correlation** (to see each filter learn its inverse),
+and — for idempotency — the **separation between real-image and composite argument
+magnitudes** (to confirm anti-drift without collapse). Compare everything against
+the existing OFF baseline; success = inert filters wake up (corr↑, Args spread↑)
+while fMSE/PSNR hold or improve.
