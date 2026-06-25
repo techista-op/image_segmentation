@@ -1,379 +1,213 @@
-# NaN / Gradient-Stability Playbook — Parallel Heads + Extra Filters
+# Harmonizer — Experiment Notes
 
-**Context:** Harmonizer, parallel-head regressor (6 independent heads, no cascade, single
-final-image loss). NaN appeared when scaling past the original 6 filters.
+Goal: reach **HDNet-class quality (~40 PSNR)** while keeping Harmonizer's
+**resolution-independence and low memory** (HDNet is limited to ~1024×1024 before
+memory blows up). The pitch is "HDNet-quality without HDNet's memory wall — works
+at any resolution." Everything below serves that goal.
 
-**Observed failures**
-- **6 parallel heads** (Temperature, Brightness, Contrast, Saturation, Highlight, Shadow): **stable.**
-- **6 + Tint:** trains fine, then **NaN around epoch ~40.**
-- **11 filters** (adds Tint, Hue Rotation, R/G/B curves): NaN, and earlier.
-- **Attempted fix — `tanh` after the `160→1` head:** NaN suppressed, but **loss started rising / stopped learning** (vanishing gradient).
-
-This doc has two parts:
-1. **The maths** — why each filter blows up, and why `tanh` traded one failure for another.
-2. **The playbook** — layered measures so explosion-fixes don't cause vanishing, plus the experiment plan.
+Discipline reminder: **change one thing per training run**, measured against a
+fixed baseline (pipeline mismatches already fixed + new color filters). Don't stack
+the decoder change, the backbone swap, and the regressor change in the same run, or
+you won't know what helped. Log **peak memory + PSNR across resolutions (1024², 4K,
+8K)** every time — that cross-resolution comparison vs HDNet is the whole point.
 
 ---
 
-## PART 1 — What was actually causing the issue (the maths)
+## 1. Decoder — what to try
 
-### 1.1 The setup that matters
+You've moved from global filter arguments to a **U-Net that predicts a dense
+per-pixel filter-coefficient map**, then upsamples the *arguments* (not the image)
+to native resolution and applies the filters there. Memory stays bounded because
+the network runs at ≤512 and only cheap coefficient maps are interpolated. This is
+the right idea and it preserves the resolution-independence story.
 
-Each head outputs **one unbounded real number** from a plain `Linear(160 → 1)` (no output
-activation). Downstream, `restore_image` does `torch.clamp(arg, -1, 1)` and hands the scalar
-to the filter. So the *argument* is bounded to [-1, 1], but the **gradient** flowing back into
-the head is whatever the filter's math produces — and that is where the blow-up lives.
+Current plan: resize to 512×512 → encode down to 16×16 → skip connections back up to
+256×256 → predict 256×256×k coefficient maps → interpolate to original size → apply
+filters.
 
-**Key fact:** the NaN is not in the argument. It is in the **filter's internal formula**, whose
-gradient becomes unbounded as the argument approaches the edge of its range.
+### What to try / decide
 
-### 1.2 The Brightness / Tint singularity (`alpha`)
+**Coefficient resolution is an ablation — don't assume 256 is best.**
+Filter corrections vary *slowly* across space. HDRNet/bilateral-learning methods
+deliberately predict **low-res coefficients** (16×16–32×32) and rely on smooth
+upsampling, because low-res coeffs resist overfitting and spatial artifacts. Dense
+256×256 coefficients give the network freedom to produce high-frequency per-pixel
+variation — exactly where seams and banding appear. **Sweep 64 / 128 / 256** and
+expect a sweet spot below 256.
 
-Both `BrightnessFilter` and `TintFilter` use the same symmetric gain:
+**Bottleneck depth and coefficient resolution are separate knobs.**
+You can bottleneck deep (16×16, more global context) *and* decode to moderate
+coefficient resolution (≤128). Favor a **deep bottleneck + moderate coefficients**
+rather than a shallow bottleneck. Harmonization benefits from global context;
+the decoder + skips reconstruct spatial detail on the way up.
 
-```
-amask  = (x >= 0)
-alpha  = (1 / ((1 - x) + eps)) * amask  +  (x + 1) * (1 - amask)        # eps = 1e-6
-```
+**Add a smoothness / TV regularizer on the argument maps from day one.**
+Per-pixel arguments near the foreground mask edge can jump sharply → visible
+halo/seam (`out = filtered*mask + original*(1-mask)`). A total-variation / gradient
+penalty on the coefficient maps (plus optional feathering near the mask boundary)
+is the standard fix. This is the most common failure mode of dense-coefficient
+harmonization — plan for it.
 
-For `x >= 0`:
+**Audit each filter for spatially-varying-argument correctness.**
+Some filters use *global* statistics internally and break when the argument becomes
+per-pixel:
+- `TemperatureFilter` computes global per-channel means (`meanR/G/B` over the whole
+  image). A per-pixel temperature argument on top of a single global mean is
+  semantically muddy — revisit the internals, not just the argument.
+- Nonlinear filters (highlight/shadow are power curves) can turn a smoothly
+  interpolated argument map into **banding** after the steep curve. Test on a
+  high-res image with a smooth-gradient foreground.
 
-```
-alpha(x) = 1 / (1 - x + eps)
-```
+**Rethink synthetic supervision so spatial DOF is actually trained.**
+Eq. 8 synthetic composites use *global* arguments → the ground-truth coefficient map
+is spatially constant → the synthetic per-stage loss gives **no signal** for spatial
+variation. Spatial capability will only come from the real (GAN) iHarmony4 half via
+the final-output loss. Either introduce spatial argument variation in the synthetic
+scheme, or weight the final-image loss more heavily.
 
-As `x → 1`:
-
-```
-alpha(1)  = 1 / eps = 1e6                      # huge but finite (eps saves the FORWARD pass)
-```
-
-The forward value is finite, so the loss looks fine. The problem is the **derivative**:
-
-```
-d(alpha)/dx = 1 / (1 - x + eps)^2
-```
-
-At `x = 0.99`:  `d(alpha)/dx ≈ 1 / (0.01)^2 = 1e4`
-At `x = 0.999`: `d(alpha)/dx ≈ 1e6`
-
-This term multiplies into the gradient that flows back to the head. The `eps` bounds the
-*forward* value but does **nothing** for this `1/(1-x)^2` gradient — it just moves the
-explosion from `x = 1` to `x = 1 - eps`.
-
-### 1.3 Why Brightness survived but Tint did not (same alpha!)
-
-This is the crux. Both filters share the identical `alpha`, yet 6+Brightness was stable and
-6+Tint NaN'd. The difference is **how each filter consumes alpha** — i.e. how many singular
-gradient paths it has.
-
-**Brightness** — applies alpha to a single channel in HSV space:
-
-```
-v_ = v * alpha
-# one multiplication; then hsv_to_rgb partially renormalizes the result
-```
-
-Gradient path off alpha: **one** linear `* alpha` term. The HSV round-trip also spreads/rebalances
-the perturbation across channels, softening it.
-
-**Tint** — applies alpha to three raw RGB channels, including a divide and a sqrt:
-
-```
-sqrt_alpha = sqrt(alpha)
-G_ = G / alpha            # divide  -> gradient ~ 1/alpha^2 * d(alpha)/dx
-R_ = R * sqrt_alpha       # sqrt    -> gradient ~ (1/(2 sqrt(alpha))) * d(alpha)/dx
-B_ = B * sqrt_alpha       # sqrt    -> another singular path
-```
-
-So at the **same argument `x`**, Tint carries **three** gradient paths off the explosive
-`d(alpha)/dx`, one of them a division (`G/alpha`) whose own derivative adds another `1/alpha^2`
-factor. Tint's backward magnitude at a given `x` is therefore much larger than Brightness's.
-
-> **Conclusion:** Brightness is a *benign* instance of the alpha formula; Tint is a *malignant*
-> one. The 6-filter parallel run was stable only because (a) it didn't contain the malignant
-> filter, and (b) iHarmony4 corrections are small, so the Brightness head sat at modest `x`
-> (≈ ±0.5–0.7, where `alpha ≈ 2–3.3`, far from the cliff). It never *visited* the dangerous
-> region. Tint reaches dangerous gradient magnitudes at argument values the Brightness head
-> was already visiting safely.
-
-### 1.4 Why "after ~40 epochs," not step 1
-
-At initialization the heads predict ≈ 0, so `x ≈ 0`, `alpha ≈ 1`, gradients are tame.
-As training sharpens predictions, the Tint head occasionally outputs `x` near ±1. Each time it
-does, the `1/(1-x)^2` term injects a large update into that head's weights, nudging it to
-predict *more* extreme values next time — a slow positive-feedback loop. It takes dozens of
-epochs to walk close enough to the singularity often enough to overflow to NaN. Once any single
-weight becomes NaN, the next forward pass propagates NaN everywhere. **Slow-burn divergence is
-the signature of an exploding-gradient feedback loop, not a forward divide-by-zero.**
-
-### 1.5 The other two fragile families (present in the 11-filter run)
-
-**Hue Rotation — `rgb_to_hsv` / `hsv_to_rgb`.**
-Hue is computed with a division by chroma `(max - min)`. For gray / near-gray pixels chroma → 0.
-- Forward: `0/0` → NaN on pure-gray pixels.
-- Backward: hue gradient contains `1/chroma`, which spikes as chroma → 0 even when the forward
-  value is fine. Masked/background regions are full of near-gray pixels, so this fires often.
-
-**Channel curves — `torch.pow(c + 1e-9, e)` with `e = 1 - x ∈ [0, 2]`.**
-The gradient w.r.t. the exponent is:
-
-```
-d/de [ base^e ] = base^e * log(base)
-```
-
-As a pixel value `c → 0`, `log(c + 1e-9) → log(1e-9) ≈ -20.7`. The `+1e-9` prevents `pow(0, ·)`
-in the *forward* pass but does not touch this `log(base)` in the *backward* pass. With **three**
-channel-curve filters (R, G, B), dark pixels feed three large-magnitude gradients back at once.
-
-### 1.6 Why `tanh` "fixed" NaN but broke learning
-
-Adding `tanh` after `160→1` made the argument unable to *reach* the singularity (tanh maps to the
-open interval (-1, 1), never exactly ±1). That suppresses the NaN — but at a cost:
-
-1. **Saturation kills the gradient.** `d/dz tanh(z) = 1 - tanh(z)^2 ≈ 0` for `|z| ≳ 2.5`. The
-   head's pre-existing weights produced moderately large pre-activations; wrapping them in `tanh`
-   put them in the flat tails → gradient ≈ 0 → the head freezes wherever it happened to be →
-   loss can't decrease and drifts **up**. This is the textbook "tanh on an already-scaled linear
-   layer" failure.
-2. **Double saturation.** `restore_image` *already* clamps to [-1, 1]. `tanh` also squashes to
-   (-1, 1). Stacking two saturating nonlinearities zeros the gradient twice.
-3. **Wrong place.** The singularity lives in the **filter's alpha math**, not in the argument.
-   `tanh` is a global, lossy bound on the *argument* to contain a *local* problem in two filters —
-   it pays a gradient-health cost across **every** filter to fix a cliff that exists in only a
-   couple of them.
-
-> **The rule that avoids the trade-off:** bound the explosion **inside the filter** (where the
-> blow-up physically is), and keep the head **linear** (so its gradient stays alive). Don't squash
-> the argument.
+### Verification checklist
+- Interp-arguments-then-apply produces smooth output for nonlinear filters (no banding).
+- No seam at mask boundary (visual + TV-loss value).
+- Peak memory stays flat as input resolution grows (the core claim).
+- PSNR measured the **same way HDNet reports it** (resolution, MSE vs fMSE, which
+  subsets) before claiming parity.
 
 ---
 
-## PART 2 — The stability playbook
+## 2. Backbones — what to try and why
 
-### 2.1 Core principle
+Framing: the encoder is now a **U-Net contracting path feeding skip connections**,
+not a global-feature trunk. EfficientNet already exposes five multi-scale outputs
+(`enc2x, enc4x, enc8x, enc16x, enc32x` with channels `[16, 24, 40, 112, 1280]`) that
+map naturally onto decoder skips. **Keep a pretrained encoder** — the decoder needs
+semantic features to know *what* is mismatched, and ImageNet pretraining gives that
+for free; a from-scratch encoder on iHarmony4-scale data is weaker.
 
-| Problem | Fix it **here** | Do **not** fix it here |
+Note: the repo's stem is **two-stream** (`_conv_fg` / `_conv_bg`, each 4-channel
+`comp+mask` / `comp+(1-mask)`, then concatenated). Keep it — fg-vs-bg comparison is
+the harmonization signal — but wire decoder skip channel dims to what the custom stem
+actually outputs, not to stock EfficientNet numbers.
+
+| Backbone | Why try it | Cost / caveat |
 |---|---|---|
-| Explosion | Inside the filter (bound `alpha`, safe `pow`, guard `hsv`) | By squashing the head output (tanh) |
-| Vanishing | Keep head linear; soft bounds; watch chained clamps | By loosening filter guards until NaN returns |
-| Both (backstop) | Global grad-norm clip + NaN-skip guard | — |
+| **EfficientNet-B0** (current) | Baseline. ~21 MB, real-time, 8K-capable — the whole speed/size story. | Likely caps below 40 PSNR on its own. |
+| **EfficientNet-B1/B2/B3** | Cleanest A/B: *only* capacity changes, same code path, same two-stream stem, same skip wiring. Richer features at modest size/speed cost. Isolates "does more backbone help at all." | Just change `from_name` + `enc_channels` + regressor/decoder input dims. |
+| **EfficientNet-V2-S** | Better accuracy-per-FLOP than V1, trains faster/more stably. Good "is bigger worth it" test. | Slightly larger; re-check stage channel dims. |
+| **ConvNeXt-Tiny/Small** | Best accuracy-per-param step up from B0 without going transformer. Strong global features, clean multi-scale outputs for skips. The "modern features" contender. | Re-wire two-stream stem + pick skip stages. Well-trodden though. |
+| **MobileNetV3 / GhostNet** | *Opposite* direction — if decoder + new filters recover enough accuracy, go **smaller** than B0 to reclaim speed/size. On-thesis for the real-time/8K pitch. | Only if priority is the resolution story over raw MSE. |
+| **MobileViT** (least-bad transformer) | If you specifically want to test the attention hypothesis at the backbone: hybrid conv+attention, small. | See transformer caveat below — rank below ConvNeXt-Tiny. |
 
-If the bound sits where the blow-up actually is, you never squash the head, so vanishing is never
-introduced in the first place.
+### Why transformers (ViT/Swin) are probably the wrong tool here
+- **Data-hungry.** iHarmony4 isn't huge; a from-scratch / lightly-tuned ViT often
+  *underperforms* a convnet of similar size at this data scale. (Same dynamic that
+  bit the self-attention regressor — attention needs scale you may not have.)
+- The paper's IHT baseline **is** a transformer harmonizer, and Harmonizer beats it
+  while being ~12× smaller — so a transformer encoder isn't obviously the path to
+  better numbers.
 
-### 2.2 Measures for gradient EXPLOSION (priority order)
-
-**1. Clamp the filter's internal gain — the real fix.**
-
-```python
-# TintFilter and BrightnessFilter, right after computing alpha:
-alpha = torch.clamp(alpha, 0.1, 10.0)     # gain never exceeds 10x / 0.1x
-
-# Channel curves — clamp the base BEFORE the implicit log in the gradient:
-base = torch.clamp(c, 1e-4, 1.0)          # log(1e-4) ≈ -9.2 is survivable; 1e-9 ≈ -20.7 is not
-c    = torch.exp(e * torch.log(base))     # == base**e, but log domain is bounded
-c    = torch.clamp(c, 0.0, 1.0)
-
-# HueRotation — keep chroma off zero so 1/chroma in the backward stays finite:
-image = torch.clamp(image, 1e-4, 1.0)     # before rgb_to_hsv
-```
-
-A 10x channel gain is already far beyond any realistic correction, and it caps `d(alpha)/dx` at a
-finite value. **Add the alpha clamp to Brightness too** — it has been living dangerously; the Tint
-run just exposed the shared formula first.
-
-**2. Global gradient-norm clipping — backstop for all heads.**
-
-```python
-loss.backward()
-torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-optimizer.step()
-```
-
-Log the returned norm. If it clips on nearly every step, the real problem is upstream → go back to
-measure 1; clipping alone is masking, not fixing.
-
-**3. Lower LR / small weight decay on heads.** 11 independent heads add capacity and total gradient.
-`lr 3e-4 → 1e-4`; optional `weight_decay=1e-5`. (Flagged as the parallel-head knobs in
-`PARALLEL_HEADS_CHANGES.md`.)
-
-**4. Small-init the final head layer** so every filter starts as a near-no-op and walks outward
-gently instead of starting hot:
-
-```python
-nn.init.normal_(head[-1].weight, std=1e-3)
-nn.init.zeros_(head[-1].bias)
-```
-
-**5. Anomaly detection — diagnosis only (slow; turn off after).**
-
-```python
-torch.autograd.set_detect_anomaly(True)   # for a few hundred steps, then remove
-```
-
-Names the exact op of the first NaN (`PowBackward`, the kornia hsv op, etc.), so you fix only the
-filter that's actually breaking.
-
-### 2.3 Measures for gradient VANISHING (which the above can trigger)
-
-**1. A head sitting *at* a hard clamp boundary has zero gradient there.** If a head's argument
-flatlines, its gain is pinned on the wall.
-- Counter: widen the clamp (10 → 20 is still physically sane), **or** replace the hard clamp with a
-  *soft* bound that has nonzero gradient everywhere:
-
-  ```python
-  # smooth, bounded gain in (1, 10), differentiable everywhere — no dead zone
-  alpha = 1.0 + 9.0 * torch.sigmoid(raw_alpha_logit)
-  ```
-
-**2. If `tanh` is kept anywhere, it vanishes unless you start in its linear zone.** Small-init the
-pre-activation, scale it (`0.9 * tanh`), and **remove the redundant downstream `clamp(-1,1)`** so
-you don't double-saturate. (Preferred: drop `tanh` entirely and use measure 2.2.1.)
-
-**3. The `clamp(image, 0, 1)` after every filter zeros gradient on saturated pixels — and 11 are
-chained.** By the time gradient flows back through all the later clamps, early filters
-(Temperature, Tint) can be starved.
-- Detect: watch the per-stage `raw_filter_i_loss` meters — if early filters go inert, they're not
-  getting signal.
-- Counter: a light auxiliary loss on an intermediate stage to inject gradient directly, or a
-  *leaky* clip (small slope outside [0, 1]) so saturated pixels still pass a trickle of gradient.
-
-### 2.4 Instrumentation — log these EVERY run (the most important measure)
-
-You cannot react to a failure you cannot see. Per step (or per epoch):
-
-- **Grad norm before clipping** — single best signal. Rising trend = explosion brewing;
-  collapsing toward 0 = vanishing.
-- **Per-head argument mean & std** (`Args/val_mean`, `Args/val_std`) — std → 0 means a dead head
-  (vanishing); mean marching toward ±1 means heading for the singularity (explosion).
-- **Per-filter raw loss** (`raw_filter_i_loss`) — flags which specific filter is inert vs active.
-- **NaN guard** — skip the step instead of poisoning all weights:
-
-  ```python
-  if not torch.isfinite(loss):
-      optimizer.zero_grad(set_to_none=True)
-      continue
-  ```
-
-### 2.5 Experiment plan
-
-> Goal: run 11 in parallel, and run "6 + one new filter at a time" to isolate which filter breaks
-> at what argument scale. Put all instrumentation (2.4) in **before** starting.
-
-1. **Control — the safe 6**, with measures 2.2.1–2.2.4 in place and full logging. Confirm grad norm
-   is stable and no head is dead. This is the baseline every other run is compared against.
-2. **6 + Tint.** Known to NaN ~ep40 without fixes. With `clamp(alpha)` in, it should hold. Watch
-   Tint's arg std — if it collapses, the clamp is too tight → widen it (vanishing check).
-3. **6 + Hue Rotation**, then **6 + R curve**, **6 + G curve**, **6 + B curve** — each new filter
-   alone on top of the 6, with anomaly detection on for the first few hundred steps. This maps each
-   filter's safe argument range empirically.
-4. **All 11 together** — only after each filter is individually stable. The chained-clamp vanishing
-   risk (2.3.3) is highest here; watch the early filters' `raw_filter_i_loss`.
-
-### 2.6 One-line summary
-
-The 6-filter parallel run was safe by *accident* (the only fragile filter, Brightness, never needed
-a large argument). Tint and the new filters reach unbounded gradients at argument values that are
-otherwise normal. **Fix the math inside the filter (clamp `alpha`, safe `pow`, guard `hsv`), keep
-the head linear, and monitor grad norm + per-head arg std** so a dead head shows up the instant it
-goes flat. `tanh` is the wrong fix because it bounds the argument by killing the gradient.
+### Honest expectation
+With a decoder predicting dense coefficients, the backbone matters **more** than it
+did in the global-scalar design (you now consume spatial feature maps, not one pooled
+vector). But the **true ceiling is still filter expressiveness + spatial granularity**,
+not encoder quality. Sequence it:
+1. **B0 → B2/B3** first (cheapest, same code). If MSE barely moves, the backbone
+   isn't your bottleneck — stop.
+2. If B2/B3 helps, try **ConvNeXt-Tiny** as the modern-features step.
+3. Only with a real reason + enough data/aug, try **MobileViT**.
 
 ---
 
-## PART 3 — Exact code changes (file by file)
+## 3. Regressor — parallel heads + refinement pass
 
-Line numbers are for the `extended_filters` branch.
+> **IMPORTANT — read first: decoder vs. scalar regressor are two different models.**
+> The parallel-heads / cascade / refinement discussion below was about predicting
+> **k global scalars** (one number per filter for the whole image). The **decoder**
+> (Section 1) predicts a **256×256×k coefficient map** instead — k spatial maps, not
+> k scalars. **If you commit to the decoder, the entire `CascadeArgumentRegressor`
+> goes away and is replaced by the decoder + a coefficient head.** Don't build both
+> a scalar regressor and a decoder in the same model — pick one. The scalar variant
+> below is only worth keeping as a **separate ablation** (global vs spatial).
+>
+> **"Should the decoder use parallel heads?"** — slightly mismatched question. The
+> decoder has no scalar "heads"; the k per-filter outputs are just channels of the
+> decoder's final conv. The real decision is *how the k coefficient channels are
+> produced and whether they interact*:
+>
+> - **Option A — single conv head (start here).** Decoder → one `Conv(C → k)` → k
+>   coefficient maps. The spatial analog of "parallel": all k produced together from
+>   shared features, no explicit interaction (they interact implicitly via shared
+>   decoder features). Cheapest, correct first baseline. At pixel level there's far
+>   more capacity than the 9-scalar bottleneck, so the overshoot problem is **less
+>   severe** here — test A before adding machinery.
+> - **Option B — per-filter conv branches.** Literal spatial parallel heads, one
+>   branch per filter. Usually **skip it** — adds params and lets filters overshoot
+>   (they don't see each other), same flaw as scalar parallel heads.
+> - **Option C — single head + channel-mixing refinement (spatial analog of the
+>   scalar "parallel + refinement").** Decoder → `Conv(C → k)` initial maps → small
+>   refinement block (a couple convs over the k coefficient channels + decoder
+>   features) → k *corrected* maps. Add this **only if Option A shows filters
+>   fighting** (over-bright / over-saturated regions). Symmetric, no order bias.
+>
+> Bottom line for the decoder: **A first, add C if you see overshoot.** Section 3
+> below applies only to a kept scalar-variant ablation.
 
-### `src/train/harmonizer/module/filter.py`
+### Background (why we're here)
+- **Cascade regressor (paper, Eq. 7):** predicts filter args sequentially, each
+  conditioned on the previous. Models filter interactions (brightness/highlight both
+  push bright pixels) — paper ablation MSE 28.47 → 26.85. But it was **order-sensitive
+  and over-weighted the first and last heads** (gradient/length imbalance in a chain).
+- **Pure parallel heads:** fixed the first/last bias, but reintroduced the problem the
+  cascade solved — filters predicted in isolation **accumulate and overshoot**. This is
+  the paper's *worse* baseline (~28.47). Worse with the new color filters, which
+  interact heavily.
+- **Self-attention over filter tokens:** trained but **worse MSE**. At k≈9 tokens
+  attention is data-hungry and under-supervised; tokens all seeded from the same pooled
+  vector → weak keys/values → tends to collapse. Attention shines at dozens–hundreds of
+  tokens, not ~9.
 
-**BrightnessFilter** — after line 30 (`alpha = ...`), **ADD:**
-```python
-        alpha = torch.clamp(alpha, 0.1, 10.0)
-```
+### The chosen approach: parallel heads → refinement
+Permutation-symmetric (no first/last bias — fixes the original complaint) **and** models
+decision-level interaction (what the cascade gave you):
 
-**TintFilter** — after line 230 (`alpha = ...`), **ADD:**
-```python
-        alpha = torch.clamp(alpha, 0.1, 10.0)
-```
+1. **Parallel heads** produce initial arguments `a_1…a_k` independently from the
+   pooled/global feature. No order bias.
+2. **Form tokens** that include the *predicted argument values* `a_i` (not just
+   features) — this is the key: later correction sees each filter's actual decision.
+3. **1–2 refinement rounds** (small attention+MLP, or just a symmetric MLP mixer) take
+   all k predictions together and output **corrected** arguments. Filters de-conflict
+   symmetrically.
 
-**ChannelCurveFilter** — **REMOVE** line 290:
-```python
-        c = torch.clamp(torch.pow(c + 1e-9, e), 0.0, 1.0)
-```
-**ADD** in its place:
-```python
-        base = torch.clamp(c, 1e-4, 1.0)
-        c = torch.exp(e * torch.log(base))
-        c = torch.clamp(c, 0.0, 1.0)
-```
+### Make the refinement trainable (this is where attention failed before)
+- **Pre-LayerNorm + residual** around the refinement block. Without these a tiny
+  attention/MLP on a regression target often won't beat the mean.
+- **1–2 heads max**, correct `1/√d` scaling, **stack 2 small layers** not 1 (single
+  layer underfits the interaction).
+- **Give tokens distinct content:** seed each from a per-filter linear projection of the
+  feature **+** its learned embedding **+** its initial predicted argument — not the same
+  pooled vector for all.
 
-**HueRotationFilter** — before line 260 (`image = kornia.color.rgb_to_hsv(image)`), **ADD:**
-```python
-        image = torch.clamp(image, 1e-4, 1.0)
-```
+### Cheaper fallback if attention still struggles at k≈9
+**Symmetric MLP mixer:** concatenate all k initial predictions + the shared feature →
+one shared MLP → k corrections. No attention machinery, far easier to train at this
+token count, often **matches** attention when k is small. Treat MLP-mixer and
+attention-refinement as the two real contenders; run both as ablations.
 
-> Mirror all four edits in `src/model/filter.py` (inference copy) to keep them in sync.
-
-### `src/train/harmonizer/trainer.py`
-
-**Grad clip + NaN guard** — REMOVE lines 159–160:
-```python
-            loss.backward()
-            self.optimizer.step()
-```
-ADD in their place:
-```python
-            if not torch.isfinite(loss):
-                self.optimizer.zero_grad(set_to_none=True)
-                continue
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-```
-
-**Instrumentation** — after the existing `add_scalar` block (around line 217), **ADD:**
-```python
-            self.writer.add_scalar('Grad/total_norm', grad_norm, step)
-            for i, arg in enumerate(arguments):
-                self.writer.add_scalar('Args/mean_{0}'.format(i), arg.mean().item(), step)
-                self.writer.add_scalar('Args/std_{0}'.format(i), arg.std().item(), step)
-```
-(Make sure `arguments` / `grad_norm` are in scope where you log; pass them through if needed.)
-
-### `src/train/harmonizer/script/train.py` (only if it still NaNs after the above)
-- CHANGE `lr` from `3e-4` → `1e-4`.
-- Optional: add `weight_decay=1e-5` to the optimizer.
-
-### To REVERT the failed `tanh` experiment
-- In `module.py` `ParallelHeadsRegressor`, REMOVE any `nn.Tanh()` added after the final
-  `Linear(base→out)`, and any `torch.tanh(...)` wrapping the head output in `forward`. The head
-  must end in a plain `Linear`. Keep the downstream `clamp(-1, 1)` in `restore_image` as the only
-  argument bound.
+### Also check (likely root cause of the original cascade bias)
+The paper's **dynamic loss strategy (Eq. 12)** exists precisely to stop the regressor
+biasing toward particular filters. The first/last over-weighting you saw is the symptom
+it targets — **confirm dynamic loss is actually on and working**. A disabled/broken
+dynamic loss reproduces exactly that bias regardless of regressor design.
 
 ---
 
-## PART 4 — Which TensorBoard graphs to watch (and how to read them)
+## Suggested ordering across all three
 
-| Graph | GOING WELL | EXPLOSION (this issue) | VANISHING (the tanh failure) |
-|---|---|---|---|
-| **`Grad/total_norm`** | steady, bounded (e.g. < a few) | spikes upward, then loss → NaN | collapses toward 0 and stays there |
-| **`Args/std_i`** (per head) | small but **non-zero**, stable | the bad head's mean drifts toward ±1 | std → 0 (head is **dead/frozen**) |
-| **`Args/mean_i`** (per head) | settles near data-realistic values | marches to ±1 (toward the singularity) | flat / stuck at init |
-| **`Loss/train_*`** | decreasing then plateau | fine, then **sudden jump to NaN** | **rising** or stuck (the tanh symptom) |
-| **`Loss/val`** | decreasing, tracks train | NaN once weights poison | rising / flat |
-| **`Loss/raw_filter_i`** | each filter's loss active | the unstable filter's loss erratic before NaN | early filters **inert/flat** (chained-clamp starvation) |
-| **`Metrics/PSNR`, `SSIM`, `MSE`, `fMSE`** | PSNR/SSIM up, MSE/fMSE down toward paper | collapse to NaN | stall / worsen |
-
-**How to confirm the diagnosis from the graphs:**
-- **It's the explosion (this NaN):** `Grad/total_norm` trends up over epochs and one `Args/mean_i`
-  walks toward ±1, *then* `Loss/train` jumps to NaN. The head whose `Args/mean_i` hit ±1 is the
-  culprit filter — confirm it's Tint/Brightness/curve/hue.
-- **It's vanishing (the tanh fix backfiring):** `Grad/total_norm` → 0, one or more `Args/std_i` → 0,
-  and `Loss/train` flat or **rising**. That means a head is frozen — loosen the bound / drop tanh.
-- **It's actually going well:** `Grad/total_norm` bounded and stable, every `Args/std_i` non-zero,
-  `Loss/val` decreasing, `Metrics/PSNR` & `SSIM` rising toward paper level with no NaN.
-
-**One-liner:** watch `Grad/total_norm` + each head's `Args/mean`/`Args/std` — rising norm with an
-arg-mean drifting to ±1 = the explosion you're chasing; norm → 0 with arg-std → 0 = the tanh-style
-vanishing; bounded norm with non-zero arg-std and falling `Loss/val` = healthy.
+1. Lock the **decoder** with **Option A (single conv head)** — coefficient-resolution
+   sweep + TV loss + filter audit + synthetic-supervision fix. This is the change with
+   a real shot at 40 PSNR. (The decoder **replaces** the scalar regressor — not both.)
+2. If Option A shows filters overshooting, add **Option C (channel-mixing refinement)**
+   over the k coefficient maps. Optionally keep a **scalar variant (Section 3) as a
+   separate global-vs-spatial ablation** — but that's a different model.
+3. Swap **B0 → B3 / ConvNeXt-Tiny** last, to feed the spatial head better; measure delta.
+4. Throughout: log **PSNR + peak memory across resolutions vs HDNet** — the contribution
+   is *quality parity at any resolution with far less memory*, so that table is the paper.
