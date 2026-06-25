@@ -211,3 +211,391 @@ dynamic loss reproduces exactly that bias regardless of regressor design.
 3. Swap **B0 → B3 / ConvNeXt-Tiny** last, to feed the spatial head better; measure delta.
 4. Throughout: log **PSNR + peak memory across resolutions vs HDNet** — the contribution
    is *quality parity at any resolution with far less memory*, so that table is the paper.
+
+
+# Image Editor Filter Math — Research Notes & Reading List
+
+> A breakdown of the exact pixel-level formulas image editors use for every major filter,
+> plus the best resources to go deeper.
+
+---
+
+## Table of Contents
+
+1. [Brightness](#1-brightness)
+2. [Contrast](#2-contrast)
+3. [Saturation](#3-saturation)
+4. [Hue Rotation](#4-hue-rotation)
+5. [Temperature](#5-temperature)
+6. [Tint](#6-tint)
+7. [Shadows & Highlights](#7-shadows--highlights)
+8. [Divide-by-Zero Guards](#8-divide-by-zero-guards)
+9. [Performance: LUTs & Approximations](#9-performance-luts--approximations)
+10. [Color Space Quick Reference](#10-color-space-quick-reference)
+11. [Recommended Reading](#11-recommended-reading)
+
+---
+
+## 1. Brightness
+
+**Color space:** sRGB RGB (all methods)
+
+Three different schools of thought:
+
+### CSS / Modern Standard — multiplicative
+```
+out = in × amount
+```
+- `amount = 0` → black, `1` → unchanged, `2` → double brightness
+- No offset, no clipping risk on the formula itself (clamp afterward)
+
+### Simple additive offset (GPUImage shader style)
+```glsl
+gl_FragColor = vec4((textureColor.rgb + vec3(brightness)), textureColor.w);
+// brightness ∈ [-1, 1]
+```
+
+### GIMP — piecewise nonlinear
+```
+if brightness < 0:  out = value × (1 + brightness)
+if brightness ≥ 0:  out = value + (1 − value) × brightness
+```
+Keeps pure black as black when brightening, avoids harsh clipping in shadows.
+
+### PIL/Pillow — blend toward black
+```
+out = factor × in        (blend between black image and original)
+```
+
+---
+
+## 2. Contrast
+
+**Color space:** sRGB RGB  
+**Key idea:** scale pixel values around a **pivot point**
+
+### CSS / GIMP baseline
+```
+out = (in − 0.5) × contrast + 0.5
+```
+Pivot = `0.5`. Implemented in CSS via `feComponentTransfer`:
+```
+slope = contrast
+intercept = −0.5 × contrast + 0.5
+```
+
+### GIMP — tangent-based (feels more perceptually even)
+```
+slant = tan((contrast + 1) × π / 4)
+out   = (in − 0.5) × slant + 0.5
+```
+At `contrast=0`, `slant=1` → identity. As `contrast→1`, `slant→∞` → hard threshold.
+
+### PIL/Pillow — mean as pivot
+```
+mean = average luminance of image
+out  = mean + factor × (in − mean)
+```
+Keeps average lightness constant during adjustment.
+
+> ⚠️ Always **clamp to [0, 1]** after contrast — the SVG spec mandates clamping negatives to 0.
+
+---
+
+## 3. Saturation
+
+**Three completely different methods depending on the tool:**
+
+### (a) CSS / SVG — luma-weighted RGB matrix (NOT real HSL)
+```
+| R' |   | 0.213+0.787s   0.715−0.715s   0.072−0.072s | | R |
+| G' | = | 0.213−0.213s   0.715+0.285s   0.072−0.072s | | G |
+| B' |   | 0.213−0.213s   0.715−0.715s   0.072+0.928s | | B |
+```
+- `s=0` → grayscale (by luma), `s=1` → identity
+- ⚠️ MDN warns: "does not convert to HSL… may not preserve hue or lightness"
+
+### (b) Shader / GPUImage — luminance mix
+```glsl
+const vec3 luma = vec3(0.2125, 0.7154, 0.0721);
+float grey = dot(textureColor.rgb, luma);
+out = mix(vec3(grey), textureColor.rgb, saturation);
+```
+- `saturation=0` → gray, `1` → original, `>1` → hypersaturated
+
+### (c) True HSL saturation
+```
+RGB → HSL → multiply S → HSL → RGB
+```
+Most "real" editors do this. Divide-by-zero risk here — see §8.
+
+---
+
+## 4. Hue Rotation
+
+**Color space:** RGB (CSS matrix) OR HSV (true rotation)
+
+### CSS `hue-rotate(θ)` — exact W3C matrix
+```
+a00 = 0.213 + 0.787·cosθ − 0.213·sinθ
+a01 = 0.715 − 0.715·cosθ − 0.715·sinθ
+a02 = 0.072 − 0.072·cosθ + 0.928·sinθ
+... (full 3×3, assembled from luma constant + cosθ term + sinθ term)
+```
+⚠️ MDN: "It does not convert to HSL… may not preserve saturation or lightness."
+
+### True hue rotation — branchless GLSL (Rodrigues rotation around gray axis)
+```glsl
+vec3 ApplyHue(vec3 col, float hueAdjust) {
+    const vec3 k = vec3(0.57735, 0.57735, 0.57735); // normalize(1,1,1)
+    float cosAngle = cos(hueAdjust);
+    return col * cosAngle
+         + cross(k, col) * sin(hueAdjust)
+         + k * dot(k, col) * (1.0 - cosAngle);
+}
+```
+
+### True hue rotation — via HSV
+```glsl
+color = hsv2rgb(rgb2hsv(color) + vec3(deltaHue / 360.0, 0.0, 0.0));
+```
+
+---
+
+## 5. Temperature
+
+**Two completely different pipelines:**
+
+### Raw pipeline (Lightroom / Camera Raw / DNG — photographically correct)
+```
+Temp (Kelvin) + Tint  →  CIE xy chromaticity white point
+                      →  interpolate ColorMatrix1/2 in inverse CCT (mired)
+                      →  CameraNeutral vector
+                      →  per-channel gains = 1 / CameraNeutral
+                      →  apply as diagonal multiply in camera-native linear RGB
+```
+Defined in the **Adobe DNG Specification, Chapter 6**.  
+⚠️ Kelvin values are NOT portable across raw converters.
+
+### 8-bit sRGB / web shader (GPUImage / FrontShaders)
+```glsl
+const vec3 warmFilter = vec3(0.93, 0.54, 0.0);
+// Step 1: YIQ tint shift (see §6)
+vec3 yiq = RGBtoYIQ * source.rgb;
+yiq.b = clamp(yiq.b + tint * 0.5226 * 0.1, -0.5226, 0.5226);
+vec3 rgb = YIQtoRGB * yiq;
+// Step 2: overlay-blend toward warm orange
+vec3 processed = overlay(rgb, warmFilter);  // per-channel overlay formula
+gl_FragColor = vec4(mix(rgb, processed, temperature), source.a);
+```
+
+---
+
+## 6. Tint
+
+**Axis:** green ↔ magenta (perpendicular to temperature on the color wheel)
+
+| Pipeline | Implementation |
+|---|---|
+| Raw (Lightroom) | Perpendicular offset off Planckian locus in CIE 1960 UCS |
+| LAB intuition | Shifts the **a\*** axis (green−magenta) |
+| Shader (GPUImage) | Shifts the **Q channel** in YIQ space |
+
+```glsl
+// YIQ tint shift
+yiq.b = clamp(yiq.b + tint * 0.5226 * 0.1, -0.5226, 0.5226);
+```
+
+**Why two axes?** Temperature fixes blue↔red(yellow) casts (daylight vs. tungsten).  
+Tint fixes green↔magenta casts (fluorescent lights, mixed sources).
+
+---
+
+## 7. Shadows & Highlights
+
+**Color space:** RGB + luminance mask  
+**Key idea:** compute a mask that selects only dark (or bright) pixels, adjust luminance,
+then rescale color to preserve hue.
+
+### Gaussian mask approach (FrontShaders / bestminr)
+```glsl
+float lum = (max(r,g,b) + min(r,g,b)) / 2.0;  // HSL lightness
+
+// 2D Gaussian in (slider, luminance) space — centered at lum~0.80 for highlights
+float lum_new = lum < 0.5 ? lum
+    : lum + a * sign(highlights)
+           * exp(-0.5 * (pow((x1-b)/c, 2) + pow((x2-d)/e, 2)));
+
+// Scale color, preserve chroma — ⚠️ divide by lum (see §8!)
+gl_FragColor = vec4(color * lum_new / lum, 1.0);
+```
+Constants `a, b, c, d, e` are tuned so the Gaussian peaks at `lum ≈ 0.80` for highlights
+and near `0.20` for shadows.
+
+### Simpler smoothstep approach (common in most editors)
+```glsl
+// Shadows
+float shadowMask = 1.0 - smoothstep(0.0, threshold, luma);
+out = in + amount * shadowMask;
+
+// Highlights
+float highlightMask = smoothstep(1.0 - threshold, 1.0, luma);
+out = in + amount * highlightMask;
+```
+
+---
+
+## 8. Divide-by-Zero Guards
+
+The most common source of image-filter bugs.
+
+### RGB → HSL / HSV
+
+```
+max  = max(R, G, B)
+min  = min(R, G, B)
+delta = max − min
+```
+
+| Division | When it's zero | Guard |
+|---|---|---|
+| Hue `÷ delta` | `delta=0` (gray pixels) | `if (max == min) { h = 0; s = 0; }` |
+| HSL S `÷ (2 − max − min)` | L = 0 or 1 (black/white) | caught by the `max==min` branch |
+| HSV S `÷ max` | `max=0` (pure black) | `if (max == 0) S = 0;` |
+| Shadows/Highlights `÷ lum` | `lum=0` (pure black) | `if (lum < 1e-6) skip or return color` |
+
+### Branchless GLSL (epsilon method — no `if` needed)
+```glsl
+vec3 rgb2hsv(vec3 c) {
+    vec4 K = vec4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
+    vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+    vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    float e = 1.0e-10;            // ← epsilon prevents division by zero
+    return vec3(abs(q.z + (q.w - q.y) / (6.0*d + e)), d / (q.x + e), q.x);
+}
+
+vec3 hsv2rgb(vec3 c) {
+    // clamp(abs(mod(...)-3)-1) trick — zero division impossible
+    vec3 rgb = clamp(abs(mod(c.x*6.0 + vec3(0,4,2), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+    return c.z * mix(vec3(1.0), rgb, c.y);  // no division at all
+}
+```
+
+---
+
+## 9. Performance: LUTs & Approximations
+
+| Technique | How it's used |
+|---|---|
+| **256-entry LUT** | Bake brightness/contrast/gamma curve into a lookup table; one array read per channel |
+| **3D LUT texture** | Entire color grade (film emulation etc.) packed into a 3D RGB texture, sampled once per pixel |
+| **Three box blurs** | W3C SVG spec mandates this as the `feGaussianBlur` approximation for large σ — within ~3% of true Gaussian |
+| **Branchless step/mix** | Replace `if` with `step()` / `mix()` to avoid GPU warp divergence |
+| **Smooth HSV** | `rgb = rgb*rgb*(3-2*rgb)` cubic smoothing inside hsv2rgb to hide banding |
+| **Integer LUT for divide** | Embedded: precompute `round(255/170·I)` to avoid float divide in HSV |
+
+---
+
+## 10. Color Space Quick Reference
+
+| Filter | Space used | Core formula | ÷0 risk |
+|---|---|---|---|
+| Brightness (CSS) | sRGB | `in × amount` | none |
+| Brightness (offset) | RGB | `in + b` | none |
+| Brightness (GIMP) | RGB | piecewise | none |
+| Contrast (CSS) | sRGB | `(in−0.5)×c + 0.5` | none |
+| Contrast (GIMP) | RGB | `(in−0.5)×tan(…) + 0.5` | none |
+| Contrast (PIL) | RGB | `mean + f×(in−mean)` | none |
+| Saturation (CSS) | RGB matrix | 3×3 luma matrix | none |
+| Saturation (shader) | RGB+luma | `mix(grey, color, s)` | none |
+| Saturation (true) | HSL/HSV | scale S channel | **YES** |
+| Hue rotate (CSS) | RGB matrix | cos/sin 3×3 | none |
+| Hue rotate (true) | HSV | `rgb2hsv + Δh → hsv2rgb` | **YES** |
+| Temperature (raw) | Camera linear RGB | per-channel gain | normalization |
+| Temperature (shader) | YIQ + overlay | Q-shift + warm blend | none |
+| Tint | YIQ Q / LAB a* / CIE UCS | Q-channel shift | none |
+| Shadows / Highlights | RGB + luma mask | Gaussian/smoothstep × ratio | **YES** (lum=0) |
+
+---
+
+## 11. Recommended Reading
+
+### 📐 Specs & Official Docs
+
+| Resource | Why read it |
+|---|---|
+| [W3C CSS Filter Effects Level 1](https://www.w3.org/TR/filter-effects-1/) | The authoritative spec for `brightness()`, `contrast()`, `saturate()`, `hue-rotate()` — includes the exact matrices |
+| [W3C SVG 1.1 Filter Effects](https://www.w3.org/TR/SVG11/filters.html) | `feColorMatrix`, `feComponentTransfer`, `feGaussianBlur` primitives with full math |
+| [Adobe DNG Specification (PDF)](https://www.adobe.com/content/dam/acom/en/products/photoshop/pdfs/dng_spec_1.7.0.0.pdf) | Chapter 6: how Temperature/Tint → CameraNeutral → per-channel gains works in raw pipelines |
+| [MDN: saturate()](https://developer.mozilla.org/en-US/docs/Web/CSS/filter-function/saturate) | Concise spec + the warning about HSL approximation |
+| [MDN: hue-rotate()](https://developer.mozilla.org/en-US/docs/Web/CSS/filter-function/hue-rotate) | Same matrix, clearer explanation |
+| [OpenCV Color Conversions](https://docs.opencv.org/4.x/de/d25/imgproc_color_conversions.html) | RGB↔HSV/HLS formulas, including the V=0 guard and OpenCV's 8-bit scaling |
+
+---
+
+### 🔬 Color Math & Conversions
+
+| Resource | Why read it |
+|---|---|
+| [niwa.nu — Math behind RGB↔HSL](https://www.niwa.nu/2013/05/math-behind-colorspace-conversions-rgb-hsl/) | Best step-by-step walkthrough of the conversion with the `max==min` guard explained |
+| [CSS-Tricks — Converting Color Spaces in JS](https://css-tricks.com/converting-color-spaces-in-javascript/) | Practical JS code for RGB↔HSL/HSV/HWB/LAB |
+| [Patriciogonzalezvivo GLSL color gist](https://gist.github.com/patriciogonzalezvivo/114c1653de9e3da6e1e3) | The canonical GLSL color-function collection (rgb2hsv, hsv2rgb, etc.) |
+| [sqlpey — HSL/RGB across languages](https://sqlpey.com/algorithm/hsl-rgb-conversion-implementations/) | Side-by-side implementations in Python, JS, C++ |
+
+---
+
+### 🎨 Shader Repositories
+
+| Resource | Why read it |
+|---|---|
+| [Shadertoy — lsSXW1](https://www.shadertoy.com/view/lsSXW1) | Color function demo — HSV/HSL in GLSL |
+| [Shadertoy — wlsSRB (Lush hsv2rgb)](https://www.shadertoy.com/view/wlsSRB) | Smooth HSV→RGB with cubic banding fix |
+| [GitHub: trevorvanhoof/ColorGrading](https://github.com/trevorvanhoof/ColorGrading) | Qt + GLSL color grading full source: shadows, highlights, saturation, hue, curves |
+| [PistonDevelopers — Useful GLSL functions](https://github.com/PistonDevelopers/shaders/wiki/Some-useful-GLSL-functions) | Concise GLSL snippets for common ops |
+
+---
+
+### 🛠️ Library Source Code
+
+| Resource | Why read it |
+|---|---|
+| [Pillow ImageEnhance.py (GitHub)](https://github.com/python-pillow/Pillow/blob/main/src/PIL/ImageEnhance.py) | See exactly how PIL implements Brightness, Contrast, Color (saturation), Sharpness — blend-toward-degenerate pattern |
+| [Pillow ImageEnhance docs](https://pillow.readthedocs.io/en/stable/reference/ImageEnhance.html) | API-level docs for the same |
+
+---
+
+### 📖 Tutorials & Explainers
+
+| Resource | Why read it |
+|---|---|
+| [Medium — Replicating GIMP Brightness/Contrast in Python](https://medium.com/@jsgreenawalt/replicating-gimps-brightness-contrast-adjustment-in-python-e9c962391162) | Step-by-step GIMP formula reverse-engineering with code |
+| [RawPedia — White Balance](https://rawpedia.rawtherapee.com/White_Balance) | How RawTherapee implements Temperature/Tint in a raw pipeline |
+| [scantips.com — White Balance Correction](https://www.scantips.com/lights/whitebalance2.html) | Plain-English explanation of per-channel gain method for white balance |
+| [objc.io — GPU-Accelerated Image Processing](https://www.objc.io/issues/21-camera-and-photos/gpu-accelerated-image-processing/) | How GPUImage runs filter chains on the GPU (iOS) |
+| [Red Queen Graphics — Metal Shaders: Luminance](http://redqueengraphics.com/2018/07/26/metal-shaders-luminance/) | Luminance weighting variants (Rec.601 vs 709) explained clearly |
+
+---
+
+### 🔭 Deep Dives (Advanced)
+
+| Resource | Why read it |
+|---|---|
+| [colour-hdri DNG docs](https://colour-hdri.readthedocs.io/en/v0.1.3/colour_hdri.models.dng.html) | Python implementation of the full DNG color pipeline |
+| *Graphics Shaders: Theory and Practice* — Bailey & Cunningham | The textbook source for the `(0.2125, 0.7154, 0.0721)` luma weights used in GPUImage |
+| [Colour-Science Python library](https://www.colour-science.org/) | Best open-source library for "proper" color math (LAB, XYZ, CCT, camera profiles) |
+
+---
+
+## Key Takeaways
+
+1. **CSS filters are matrix math on sRGB** — fast and GPU-accelerated but approximate.  
+   Use them for simple UI effects; don't expect them to match Lightroom.
+
+2. **"True" saturation/hue adjustments need HSL/HSV** — which means color-space conversion, which means divide-by-zero guards. Use the epsilon (`1e-10`) branchless GLSL approach on the GPU.
+
+3. **Temperature in raw ≠ temperature on JPEG.** Raw is per-channel linear gains from a camera matrix. JPEG/web is a YIQ Q-shift + warm overlay blend — a visual approximation.
+
+4. **Shadows/Highlights is a luminance mask + ratio rescale.** The mask (smoothstep or Gaussian) determines which tones move; the `color × lum_new / lum` preserves hue. Guard against `lum = 0`.
+
+5. **When in doubt, bake to a LUT.** Any curve you can compute per-pixel can be precomputed into a 256-entry table (1D) or 3D LUT texture and applied in one sample.
