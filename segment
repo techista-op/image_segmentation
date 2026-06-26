@@ -1,601 +1,430 @@
-# Harmonizer — Experiment Notes
+# The Human Workflow for Image Harmonization in Compositing: A Technical Deep-Dive for ML Model Design
 
-Goal: reach **HDNet-class quality (~40 PSNR)** while keeping Harmonizer's
-**resolution-independence and low memory** (HDNet is limited to ~1024×1024 before
-memory blows up). The pitch is "HDNet-quality without HDNet's memory wall — works
-at any resolution." Everything below serves that goal.
+## TL;DR
+- Professional harmonization is a **divide-and-conquer pipeline**: cut out → place → match luminance (black point → white point → midtones/gamma) → match color (grayscale balance, then hue/temperature/tint) → match physical cues (shadows, light wrap, grain, defocus, lens artifacts, atmosphere) → final grade. Retouchers fix grayscale/luminance *before* color, because the eye is far more sensitive to brightness mismatches than to many other errors.
+- The single most important insight for ML: human compositors and the academic literature agree the core problem is **making the foreground's illumination statistics consistent with the background** — the same insight that drives the iHarmony4/DoveNet line of work. But humans go beyond pixel statistics to physical cues (shadows, light wrap, grain, DOF) that pure-color harmonization models ignore.
+- Perceptual research (Ferwerda, Selan & Pellacini 2010) shows humans are **highly sensitive to "pixel errors"** (brightness/color-temperature mismatches that change image statistics) but **surprisingly insensitive to "cue errors"** (wrong light/shadow direction) — explaining why color/luminance harmonization yields the biggest perceived realism gains and is where ML should focus first.
 
-Discipline reminder: **change one thing per training run**, measured against a
-fixed baseline (pipeline mismatches already fixed + new color filters). Don't stack
-the decoder change, the backbone swap, and the regressor change in the same run, or
-you won't know what helped. Log **peak memory + PSNR across resolutions (1024², 4K,
-8K)** every time — that cross-resolution comparison vs HDNet is the whole point.
+## Key Findings
 
----
+1. **Order matters and is consistent across disciplines.** Whether in Photoshop (retouchers) or Nuke (VFX), the workflow is: grayscale/luminance match first (black point, white point, midtone gamma), then color, then physical realism layers. Steve Wright's standard textbook *Digital Compositing for Film and Video* codifies this exact sequence.
+2. **The "match black and white points first" trick is foundational.** Both Photoshop's Curves/Levels eyedroppers and Nuke's Grade node operate on the same principle: sample the darkest and lightest points of the BG and force the FG's blacks and whites to those values (offset for blacks, gain/multiply for whites), then adjust gamma for midtones.
+3. **Harmonization ≠ color matching alone.** Believable composites require matching ~10 non-color dimensions: light direction/quality/intensity, cast/contact shadows, ambient occlusion, light wrap, grain/noise, defocus/DOF/bokeh, lens artifacts (chromatic aberration, vignetting, distortion), atmospheric perspective, edge treatment, and interactive/bounce light.
+4. **Humans use specific perceptual tricks**: squinting/blurring to compare overall value masses, sampling colors numerically via eyedropper/Info panel (RGB/CMYK), the "Average filter" to extract a representative BG color, and projecting that onto the FG via Color/Soft Light blend modes through clipping masks.
+5. **The ML connection is direct**: iHarmony4/DoveNet frame harmonization as translating the FG into the same "domain" (illumination condition) as the BG — a learned version of the human grayscale-then-color matching process. Newer work (DIH-GAN, shadow harmonization) adds the physical cues humans handle manually.
 
-## 1. Decoder — what to try
+## Details
 
-You've moved from global filter arguments to a **U-Net that predicts a dense
-per-pixel filter-coefficient map**, then upsamples the *arguments* (not the image)
-to native resolution and applies the filters there. Memory stays bounded because
-the network runs at ≤512 and only cheap coefficient maps are interpolated. This is
-the right idea and it preserves the resolution-independence story.
+### Part 1 — The full list of color/tone adjustments humans tune
 
-Current plan: resize to 512×512 → encode down to 16×16 → skip connections back up to
-256×256 → predict 256×256×k coefficient maps → interpolate to original size → apply
-filters.
+Harmonization color work decomposes into two stages that professionals keep deliberately separate: **luminance/grayscale**, then **chroma/color**. This separation is the core mental model. As Steve Wright describes it, converting to monochrome to first fix the grayscale "gets the color out of the way and lets the eye focus on the grayscale, or the luminance parts of the picture… a divide and conquer strategy designed to pare down and simplify the task."
 
-### What to try / decide
+**Brightness / exposure / luminance matching.** The first and most important adjustment. The FG's overall tonal level must sit in the BG's exposure range. If the BG was shot in low light, a brightly-lit FG "pops out" immediately. This is what VFX artists call matching "levels" or "luminance" — aligning the overall contrast level so a FG with "dark grey blacks" isn't dropped into footage with "deep blacks." This is tuned via exposure/brightness sliders, Levels, or the gain/lift controls in a grade node.
 
-**Coefficient resolution is an ablation — don't assume 256 is best.**
-Filter corrections vary *slowly* across space. HDRNet/bilateral-learning methods
-deliberately predict **low-res coefficients** (16×16–32×32) and rely on smooth
-upsampling, because low-res coeffs resist overfitting and spatial artifacts. Dense
-256×256 coefficients give the network freedom to produce high-frequency per-pixel
-variation — exactly where seams and banding appear. **Sweep 64 / 128 / 256** and
-expect a sweet spot below 256.
+**Black point / white point / levels.** The technical backbone of luminance matching. Every image has a dynamic range between its darkest and lightest pixels. Retouchers identify the FG's black point (darkest pixel) and white point (lightest pixel) and remap them to match the BG's. In Nuke this is explicit: with a Grade node you "measure the 'whitepoint' (whitest part of the CG) and the 'blackpoint' (darkest part of the CG)… Subsequently, we go to our background plate and measure 'gain' (for the whites) and the 'lift' (for the darks)." Critically, **black-point matching is an offset (additive) operation** and **white-point matching is a gain (scaling/multiply) operation** — Wright's "scaling vs. offset" distinction. This is why pros set them independently.
 
-**Bottleneck depth and coefficient resolution are separate knobs.**
-You can bottleneck deep (16×16, more global context) *and* decode to moderate
-coefficient resolution (≤128). Favor a **deep bottleneck + moderate coefficients**
-rather than a shallow bottleneck. Harmonization benefits from global context;
-the decoder + skips reconstruct spatial detail on the way up.
+**Contrast.** A direct consequence of black/white point placement plus the midtone curve. Mismatched contrast is one of the three "levels" errors VFX artists check (luminance, color tone, saturation). Often a slight S-curve in the RGB channel is added to make the FG "look more realistic" in the BG.
 
-**Add a smoothness / TV regularizer on the argument maps from day one.**
-Per-pixel arguments near the foreground mask edge can jump sharply → visible
-halo/seam (`out = filtered*mask + original*(1-mask)`). A total-variation / gradient
-penalty on the coefficient maps (plus optional feathering near the mask boundary)
-is the standard fix. This is the most common failure mode of dense-coefficient
-harmonization — plan for it.
+**Shadows, midtones, highlights (lift/gamma/gain, tone curves).** After blacks and whites are pinned, the **midtones are matched via gamma** (which bends the midtone response while leaving black/white points fixed). In color-grading vocabulary: **Lift** raises shadows, **Gamma** controls midtones, **Gain** controls highlights — the three-way tonal control found in every grade node and in Photoshop Curves (by placing points in the shadow/mid/highlight regions of the curve).
 
-**Audit each filter for spatially-varying-argument correctness.**
-Some filters use *global* statistics internally and break when the argument becomes
-per-pixel:
-- `TemperatureFilter` computes global per-channel means (`meanR/G/B` over the whole
-  image). A per-pixel temperature argument on top of a single global mean is
-  semantically muddy — revisit the internals, not just the argument.
-- Nonlinear filters (highlight/shadow are power curves) can turn a smoothly
-  interpolated argument map into **banding** after the steep curve. Test on a
-  high-res image with a smooth-gradient foreground.
+**Color temperature (white balance / warm–cool).** The blue–orange axis. A FG shot under cool/shade light dropped into a warm/golden-hour BG is the most common and most jarring mismatch. Retouchers warm or cool the FG to match the BG's ambient. This is the dominant axis because natural light sources vary enormously in temperature (shade ~7000K, sun ~5500K, tungsten ~3200K).
 
-**Rethink synthetic supervision so spatial DOF is actually trained.**
-Eq. 8 synthetic composites use *global* arguments → the ground-truth coefficient map
-is spatially constant → the synthetic per-stage loss gives **no signal** for spatial
-variation. Spatial capability will only come from the real (GAN) iHarmony4 half via
-the final-output loss. Either introduce spatial argument variation in the synthetic
-scheme, or weight the final-image loss more heavily.
+**Tint (green–magenta axis).** The secondary white-balance axis, perpendicular to temperature. Important for matching fluorescent/mixed lighting and for neutralizing color casts that temperature alone can't fix.
 
-### Verification checklist
-- Interp-arguments-then-apply produces smooth output for nonlinear filters (no banding).
-- No seam at mask boundary (visual + TV-loss value).
-- Peak memory stays flat as input resolution grows (the core claim).
-- PSNR measured the **same way HDNet reports it** (resolution, MSE vs fMSE, which
-  subsets) before claiming parity.
+**Saturation / vibrance.** The intensity of color must match. "It doesn't make sense for a dull asset to be comped into a brightly colored scene." Distant/atmospheric elements are also *desaturated* (see atmospheric perspective). Vibrance (a non-linear, skin-tone-protecting saturation) is preferred for portraits.
 
----
+**Hue shifts.** Fine adjustments to specific color ranges (e.g., shifting FG greens to match BG foliage), usually via Hue/Saturation targeted channels or curves on individual color channels.
 
-## 2. Backbones — what to try and why
+**Color cast / ambient color spill / environmental color bleeding.** Real objects pick up the color of their surroundings — bounce light from a green lawn, blue from the sky, orange from a sunset. Retouchers add this by sampling the BG's dominant color and projecting it onto the FG (the Average-filter + Color/Soft-Light blend-mode technique). This is "the light that shines from the sky on the hair" and "light that is reflected from the ground onto the model."
 
-Framing: the encoder is now a **U-Net contracting path feeding skip connections**,
-not a global-feature trunk. EfficientNet already exposes five multi-scale outputs
-(`enc2x, enc4x, enc8x, enc16x, enc32x` with channels `[16, 24, 40, 112, 1280]`) that
-map naturally onto decoder skips. **Keep a pretrained encoder** — the decoder needs
-semantic features to know *what* is mismatched, and ImageNet pretraining gives that
-for free; a from-scratch encoder on iHarmony4-scale data is weaker.
+**Color grading via curves and color balance per tonal range.** The most surgical technique: adjusting color separately in shadows, midtones, and highlights. Photoshop's Color Balance and Curves (per-channel) let you, e.g., push shadows blue and highlights warm. Wright's "Constant Green" / "Constant Brightness" method color-corrects while preserving luminance.
 
-Note: the repo's stem is **two-stream** (`_conv_fg` / `_conv_bg`, each 4-channel
-`comp+mask` / `comp+(1-mask)`, then concatenated). Keep it — fg-vs-bg comparison is
-the harmonization signal — but wire decoder skip channel dims to what the custom stem
-actually outputs, not to stock EfficientNet numbers.
+**Matching the BG's color grade / LUT.** In film, the whole shot eventually receives a unified grade or LUT; the compositor must ensure the FG sits correctly *before* and survives *after* that grade. Photoshop offers Color Lookup adjustment layers (applying LUTs); Lightroom uses profiles and the calibration/color-grading panels.
 
-| Backbone | Why try it | Cost / caveat |
-|---|---|---|
-| **EfficientNet-B0** (current) | Baseline. ~21 MB, real-time, 8K-capable — the whole speed/size story. | Likely caps below 40 PSNR on its own. |
-| **EfficientNet-B1/B2/B3** | Cleanest A/B: *only* capacity changes, same code path, same two-stream stem, same skip wiring. Richer features at modest size/speed cost. Isolates "does more backbone help at all." | Just change `from_name` + `enc_channels` + regressor/decoder input dims. |
-| **EfficientNet-V2-S** | Better accuracy-per-FLOP than V1, trains faster/more stably. Good "is bigger worth it" test. | Slightly larger; re-check stage channel dims. |
-| **ConvNeXt-Tiny/Small** | Best accuracy-per-param step up from B0 without going transformer. Strong global features, clean multi-scale outputs for skips. The "modern features" contender. | Re-wire two-stream stem + pick skip stages. Well-trodden though. |
-| **MobileNetV3 / GhostNet** | *Opposite* direction — if decoder + new filters recover enough accuracy, go **smaller** than B0 to reclaim speed/size. On-thesis for the real-time/8K pitch. | Only if priority is the resolution story over raw MSE. |
-| **MobileViT** (least-bad transformer) | If you specifically want to test the attention hypothesis at the backbone: hybrid conv+attention, small. | See transformer caveat below — rank below ConvNeXt-Tiny. |
+### Part 2 — Beyond color: the physical dimensions of harmonization
 
-### Why transformers (ViT/Swin) are probably the wrong tool here
-- **Data-hungry.** iHarmony4 isn't huge; a from-scratch / lightly-tuned ViT often
-  *underperforms* a convnet of similar size at this data scale. (Same dynamic that
-  bit the self-attention regressor — attention needs scale you may not have.)
-- The paper's IHT baseline **is** a transformer harmonizer, and Harmonizer beats it
-  while being ~12× smaller — so a transformer encoder isn't obviously the path to
-  better numbers.
+**Matching light direction, quality, and intensity.** Wright and VFX guides list three lighting components to match: (1) **Direction** — where the key light comes from; a FG lit from the left in a right-lit scene reads as fake; (2) **Quality** — hard (sharp-edged shadows, small/distant source) vs. soft (diffuse, large/close source); (3) **Intensity** — overall brightness of the source. Lighting direction is matched *after* color in Wright's sequence.
 
-### Honest expectation
-With a decoder predicting dense coefficients, the backbone matters **more** than it
-did in the global-scalar design (you now consume spatial feature maps, not one pooled
-vector). But the **true ceiling is still filter expressiveness + spatial granularity**,
-not encoder quality. Sequence it:
-1. **B0 → B2/B3** first (cheapest, same code). If MSE barely moves, the backbone
-   isn't your bottleneck — stop.
-2. If B2/B3 helps, try **ConvNeXt-Tiny** as the modern-features step.
-3. Only with a real reason + enough data/aug, try **MobileViT**.
+**Adding/matching shadows.** Three distinct shadow types: (1) **Contact shadow / ambient occlusion** — the darkest, sharpest shadow exactly where the object meets the ground; its absence makes objects "look like they are hovering in anti-gravity"; (2) **Cast shadow** — the softer, elongated shadow thrown by the key light, whose direction and softness must match the BG; (3) **Ambient occlusion** — soft self-shadowing in crevices. In Photoshop these are painted/transformed on layers set to **Multiply** blend mode (so they darken realistically); in 3D/VFX an AO pass is multiplied over the beauty render. Realistic shadows need correct color (often not pure black — they take the ambient/sky color) and density. A common Photoshop method: duplicate the FG, fill black, Edit > Transform > Distort to lay it on the floor, Gaussian-blur, set to Multiply, and mask a falloff.
 
----
+**Light wrap / edge light bleeding.** When a FG sits against a bright BG, light from the BG visually "wraps" around the FG's edges. This is one of the most important believability tricks. In Nuke there's a dedicated **LightWrap node** ("creates a reflection of light around the edges of your foreground object by blending in whatever is in the background… apply LightWrap on your foreground element before you composite the foreground over the background"). In Photoshop it's faked by stamping a merged copy of the BG, clipping it to the FG, blurring, and using Screen/Color blend modes, or by painting soft white/colored light along edges at low opacity.
 
-## 3. Regressor — parallel heads + refinement pass
+**Matching grain/noise.** Clean FG over grainy BG "pops out immediately." Compositors analyze and replicate 5 grain characteristics: **intensity, luminance curves** (digital cameras have "heavy grain in blacks and blue channels with light grain in highlights"), **size, sharpness/softness, and irregularity/shape.** Best practice: sample noise from the BG's shadow regions, and **always check grain match at 1:1 pixel resolution, not scaled down** ("grain mismatches that are invisible at half-res become obvious at full resolution, and that's the resolution the client reviews at"). Grain is typically added last, after grading, and constrained within the FG alpha.
 
-> **IMPORTANT — read first: decoder vs. scalar regressor are two different models.**
-> The parallel-heads / cascade / refinement discussion below was about predicting
-> **k global scalars** (one number per filter for the whole image). The **decoder**
-> (Section 1) predicts a **256×256×k coefficient map** instead — k spatial maps, not
-> k scalars. **If you commit to the decoder, the entire `CascadeArgumentRegressor`
-> goes away and is replaced by the decoder + a coefficient head.** Don't build both
-> a scalar regressor and a decoder in the same model — pick one. The scalar variant
-> below is only worth keeping as a **separate ablation** (global vs spatial).
->
-> **"Should the decoder use parallel heads?"** — slightly mismatched question. The
-> decoder has no scalar "heads"; the k per-filter outputs are just channels of the
-> decoder's final conv. The real decision is *how the k coefficient channels are
-> produced and whether they interact*:
->
-> - **Option A — single conv head (start here).** Decoder → one `Conv(C → k)` → k
->   coefficient maps. The spatial analog of "parallel": all k produced together from
->   shared features, no explicit interaction (they interact implicitly via shared
->   decoder features). Cheapest, correct first baseline. At pixel level there's far
->   more capacity than the 9-scalar bottleneck, so the overshoot problem is **less
->   severe** here — test A before adding machinery.
-> - **Option B — per-filter conv branches.** Literal spatial parallel heads, one
->   branch per filter. Usually **skip it** — adds params and lets filters overshoot
->   (they don't see each other), same flaw as scalar parallel heads.
-> - **Option C — single head + channel-mixing refinement (spatial analog of the
->   scalar "parallel + refinement").** Decoder → `Conv(C → k)` initial maps → small
->   refinement block (a couple convs over the k coefficient channels + decoder
->   features) → k *corrected* maps. Add this **only if Option A shows filters
->   fighting** (over-bright / over-saturated regions). Symmetric, no order bias.
->
-> Bottom line for the decoder: **A first, add C if you see overshoot.** Section 3
-> below applies only to a kept scalar-variant ablation.
+**Matching blur / depth of field / focus / bokeh.** The FG must match the BG's focus plane. Two parameters: **focus amount** (sharpness/softness — macro shots have shallow DOF, establishing shots deep) and **bokeh shape** (the shape of out-of-focus highlights, determined by the lens iris — circular, donut, cat's-eye). A razor-sharp FG in a softly-defocused BG breaks the illusion. Nuke uses Defocus/ZDefocus nodes.
 
-### Background (why we're here)
-- **Cascade regressor (paper, Eq. 7):** predicts filter args sequentially, each
-  conditioned on the previous. Models filter interactions (brightness/highlight both
-  push bright pixels) — paper ablation MSE 28.47 → 26.85. But it was **order-sensitive
-  and over-weighted the first and last heads** (gradient/length imbalance in a chain).
-- **Pure parallel heads:** fixed the first/last bias, but reintroduced the problem the
-  cascade solved — filters predicted in isolation **accumulate and overshoot**. This is
-  the paper's *worse* baseline (~28.47). Worse with the new color filters, which
-  interact heavily.
-- **Self-attention over filter tokens:** trained but **worse MSE**. At k≈9 tokens
-  attention is data-hungry and under-supervised; tokens all seeded from the same pooled
-  vector → weak keys/values → tends to collapse. Attention shines at dozens–hundreds of
-  tokens, not ~9.
+**Matching lens characteristics.** Real lenses add imperfections that CG/cutout FGs lack: **chromatic aberration** ("purple fringing" on high-contrast edges), **vignetting** (darkening toward frame corners), **lens distortion** (barrel/pincushion — matched via a lens grid/distortion node), and **halation/glow** around bright sources. The "Glowden Rule" (Nick Chamberlain): when your glow looks right, cut it in half.
 
-### The chosen approach: parallel heads → refinement
-Permutation-symmetric (no first/last bias — fixes the original complaint) **and** models
-decision-level interaction (what the cascade gave you):
+**Atmospheric perspective / haze / depth cues.** Distant objects appear (1) lower contrast, (2) lighter/lifted blacks, (3) shifted toward blue/cool (Rayleigh scattering — blue scatters ~9.4× more than red), and (4) desaturated and less detailed. A FG meant to read as distant must be hazed accordingly; the haze should be matched to light direction (backlit scenes show more haze).
 
-1. **Parallel heads** produce initial arguments `a_1…a_k` independently from the
-   pooled/global feature. No order bias.
-2. **Form tokens** that include the *predicted argument values* `a_i` (not just
-   features) — this is the key: later correction sees each filter's actual decision.
-3. **1–2 refinement rounds** (small attention+MLP, or just a symmetric MLP mixer) take
-   all k predictions together and output **corrected** arguments. Filters de-conflict
-   symmetrically.
+**Edge treatment.** Cutout edges must be cleaned: **defringing/decontamination** (removing residual BG color in semi-transparent edge pixels — e.g., green spill from a green screen), **edge blending** (softening to match the BG's effective sharpness), and edge color modification to fit the new environment. Hair and motion-blurred edges are the hardest.
 
-### Make the refinement trainable (this is where attention failed before)
-- **Pre-LayerNorm + residual** around the refinement block. Without these a tiny
-  attention/MLP on a regression target often won't beat the mean.
-- **1–2 heads max**, correct `1/√d` scaling, **stack 2 small layers** not 1 (single
-  layer underfits the interaction).
-- **Give tokens distinct content:** seed each from a per-filter linear projection of the
-  feature **+** its learned embedding **+** its initial predicted argument — not the same
-  pooled vector for all.
+**Reflections and interactive/bounce light.** If the FG sits on a reflective surface, it needs a reflection; if it's near colored surfaces, it should cast/receive bounce light. Interactive light (the FG appearing to illuminate or be illuminated by the scene) sells integration.
 
-### Cheaper fallback if attention still struggles at k≈9
-**Symmetric MLP mixer:** concatenate all k initial predictions + the shared feature →
-one shared MLP → k corrections. No attention machinery, far easier to train at this
-token count, often **matches** attention when k is small. Treat MLP-mixer and
-attention-refinement as the two real contenders; run both as ablations.
+### Part 3 — The process / order of operations
 
-### Also check (likely root cause of the original cascade bias)
-The paper's **dynamic loss strategy (Eq. 12)** exists precisely to stop the regressor
-biasing toward particular filters. The first/last over-weighting you saw is the symptom
-it targets — **confirm dynamic loss is actually on and working**. A disabled/broken
-dynamic loss reproduces exactly that bias regardless of regressor design.
+The canonical professional sequence, synthesized from Photoshop compositing experts and Steve Wright's *Digital Compositing for Film and Video*:
 
----
+1. **Image selection & assessment.** Before any pixels move, pros assess whether the FG and BG are even compatible — matching **perspective** (camera height, horizon line, lens compression), light direction, and resolution. "One photo may work better than another." A perspective mismatch (e.g., FG shot from above, BG at eye level) cannot be fixed by any amount of color work.
+2. **Cut out / mask the FG** with clean, refined edges (Select & Mask, roto, or keying), with decontamination of edge colors.
+3. **Rough placement** — position, scale, and orient the FG to respect perspective and horizon.
+4. **Match luminance / grayscale first** — this is the heart of it:
+   - Set the **black point** (offset the FG's darkest values to the BG's).
+   - Set the **white point** (gain/scale the FG's highlights to the BG's).
+   - Match **midtones via gamma**.
+   - **Gamma slam** (Wright's diagnostic): push gamma way up or down to exaggerate and expose mismatches in blacks/edges, then dial back.
+5. **Match color** (only after grayscale is locked):
+   - **Grayscale/channel balancing** — view and adjust one channel at a time.
+   - Match **color temperature and tint** to the BG ambient.
+   - Adjust **flesh tones** if a person.
+   - Use the **"Constant Green/Constant Brightness"** method to correct color without disturbing luminance.
+   - Add **ambient color spill** from the BG.
+6. **Match lighting direction and quality** — repaint highlights/shadows if the FG's modeling light doesn't agree with the BG.
+7. **Add shadows** — contact shadow, then cast shadow (Multiply layers), then AO.
+8. **Light wrap** — bleed BG edge light onto the FG.
+9. **Match physical/optical attributes** — defocus/DOF, lens distortion, chromatic aberration, vignetting, atmosphere.
+10. **Grain/noise match** — added near the end, checked at 1:1.
+11. **Final unified grade / LUT** over the whole composite, plus a checklist pass.
 
-## Suggested ordering across all three
+**Reference points pros use:** sampling the BG's darkest pixel (for black point), brightest pixel (white point), and a neutral/gray area (for white balance) via eyedroppers; using Photoshop's **Auto Color Correction Options → "Find Dark & Light Colors"** which lets you eyedrop shadow, midtone, and highlight target colors directly from the BG; reading numeric RGB/CMYK values in the **Info panel** to match colors objectively; and comparing histograms/scopes.
 
-1. Lock the **decoder** with **Option A (single conv head)** — coefficient-resolution
-   sweep + TV loss + filter audit + synthetic-supervision fix. This is the change with
-   a real shot at 40 PSNR. (The decoder **replaces** the scalar regressor — not both.)
-2. If Option A shows filters overshooting, add **Option C (channel-mixing refinement)**
-   over the k coefficient maps. Optionally keep a **scalar variant (Section 3) as a
-   separate global-vs-spatial ablation** — but that's a different model.
-3. Swap **B0 → B3 / ConvNeXt-Tiny** last, to feed the spatial head better; measure delta.
-4. Throughout: log **PSNR + peak memory across resolutions vs HDNet** — the contribution
-   is *quality parity at any resolution with far less memory*, so that table is the paper.
+### Part 4 — Techniques and mental models
 
+**Reading a scene's lighting and color.** Pros first identify: Where is the key light? How hard/soft? What color/temperature is it? What's the ambient/fill color? Where are the cast shadows pointing and how soft are they? What's the overall contrast and black level?
 
-# Image Editor Filter Math — Research Notes & Reading List
+**Matching black and white points first.** The "3-click" eyedropper method: in a Curves/Levels adjustment, double-click the black-point eyedropper and set a target (e.g., RGB 20,20,20 or B=5% for headroom), the white-point eyedropper (e.g., B=95%), then click the corresponding points in the image. The gray-point eyedropper neutralizes color cast by clicking something that *should* be neutral gray (equal RGB). Pros build in 5% black/white "headroom" so subtle detail survives. A practical compositing variant (Rikard Rodin): add two Curves layers clipped to the FG — one for color, one for tone — and use "Find Dark and Light Colors" to eyedrop shadow/midtone/highlight targets straight from the BG.
 
-> A breakdown of the exact pixel-level formulas image editors use for every major filter,
-> plus the best resources to go deeper.
+**Adjustment layers, clipping masks, blend modes.** The non-destructive backbone in Photoshop. A Curves/Hue-Sat/Color-Balance adjustment layer is **clipped (Alt+click between layers)** so it affects only the FG. Key blend modes:
+- **Multiply** — darkens; for shadows and contact shadows.
+- **Screen** — lightens; for glows, light wrap, atmospheric haze.
+- **Soft Light / Overlay** — contrast and subtle color/light projection (e.g., ambient color from BG).
+- **Color** — applies hue/saturation only, leaving luminance intact (for pure color matching).
+- **Luminosity** — applies tone only, leaving color intact.
+- **Blend If** sliders — blend FG into BG based on underlying tonal values (great for hair/edges).
 
----
+**Sampling / eyedropper to match numerically.** Use the Color Sampler tool to place persistent readouts on FG and BG equivalents and adjust until RGB values converge. Skin is often matched in CMYK. The **Average filter** (Filter > Blur > Average) collapses the BG to one representative color, which is then projected onto the FG via a Color-blend clipped layer at low opacity.
 
-## Table of Contents
+**Squinting / blurring to compare tone.** Borrowed from painting: squinting (or applying a blur, or using median blur) "groups values in an overall way and stops your eye from automatically adjusting." It eliminates detail so you compare the FG and BG's overall value masses and whether the FG's tonal weight belongs. The principle, repeated across painting instruction: "Squint AND Compare."
 
-1. [Brightness](#1-brightness)
-2. [Contrast](#2-contrast)
-3. [Saturation](#3-saturation)
-4. [Hue Rotation](#4-hue-rotation)
-5. [Temperature](#5-temperature)
-6. [Tint](#6-tint)
-7. [Shadows & Highlights](#7-shadows--highlights)
-8. [Divide-by-Zero Guards](#8-divide-by-zero-guards)
-9. [Performance: LUTs & Approximations](#9-performance-luts--approximations)
-10. [Color Space Quick Reference](#10-color-space-quick-reference)
-11. [Recommended Reading](#11-recommended-reading)
+**Common rules of thumb:** match grayscale before color; set blacks and whites before midtones; check grain at 100%; the Glowden Rule (halve your glow); shadows are rarely pure black (they carry ambient color); subtle is better (light wrap "you may not even notice — that's the point"); if the FG "starts way off," color correction becomes much harder, so choose compatible source images.
 
----
+### Part 5 — Software-specific context
 
-## 1. Brightness
+**Photoshop (retouchers/photographers).** Adjustment layers clipped to the FG:
+- **Curves** — the workhorse; black/white/gray eyedroppers, per-channel color, contrast S-curves. The Auto "Find Dark & Light Colors" enables direct BG sampling for shadows/mids/highlights.
+- **Levels** — black/white/gamma sliders and the same eyedroppers.
+- **Color Balance** — shadows/midtones/highlights color shifting.
+- **Hue/Saturation** — global or per-color-range hue, saturation, lightness.
+- **Photo Filter** — quick warm/cool (temperature) adjustment.
+- **Color Lookup** — applies LUTs to match a BG's grade.
+- **Match Color** (Image > Adjustments) — "adjust luminance, color intensity, and color cast while matching colors between images" (RGB only).
+- **Harmonize Neural Filter** — Adobe's built-in ML harmonization that auto-matches FG color/tone to the BG (directly analogous to the academic models).
+- Blend modes, clipping masks, Blend If, and the Average filter as above.
 
-**Color space:** sRGB RGB (all methods)
+**Lightroom.** Less for compositing, more for matching looks across images: White Balance (Temp/Tint), Exposure/Contrast/Highlights/Shadows/Whites/Blacks, HSL, Tone Curve, Calibration, and Color Grading (shadow/midtone/highlight color wheels). Range masks for local adjustment.
 
-Three different schools of thought:
+**Nuke (VFX/film).** Node-based:
+- **Grade node** — the primary tool; lift/gamma/gain/multiply/offset/blackpoint/whitepoint, with Ctrl+drag sampling to pick black/white points from FG and BG.
+- **ColorCorrect node** — separate saturation/contrast/gain/gamma/offset for shadows/midtones/highlights independently.
+- **Merge node** (plus/multiply/over) — combining elements and passes.
+- **LightWrap node** — edge light bleed.
+- **Defocus / ZDefocus** — DOF/bokeh matching.
+- **Grain / ScannedGrain** — grain matching.
+- **Premult / Unpremult** — correct edge handling before/after color ops.
+- Multi-pass workflow: shuffle out AOVs (diffuse, specular, SSS, reflection, shadow, depth), grade each, merge (light passes plus, shadows multiply), rebuild beauty, copy alpha, premult.
+- Color management via OCIO/ACES (work in linear/ACES2065-1, apply output transform for display).
 
-### CSS / Modern Standard — multiplicative
+### Part 6 — The theory of why harmonization works
+
+A composite looks "off" when the brain detects **inconsistencies that violate a single-scene, single-camera, single-light-environment model**. The brain has strong priors about how light behaves.
+
+The pivotal perceptual finding: **Ferwerda, Selan & Pellacini (2010), "Perception of Lighting Errors in Image Compositing"** (Proc. IS&T/SID 18th Color and Imaging Conference, pp. 375–380; affiliations RIT, Cornell, Dartmouth) distinguish two error classes. **Pixel errors** = differences in illumination intensity or color temperature that change the image statistics of FG vs. BG. **Cue errors** = differences in illumination or shadow *direction* that leave statistics unchanged but introduce conflicting spatial lighting information. Their result: "observers are reasonably sensitive to pixel errors that change the statistics of the foreground and background image regions, they are less sensitive to cue errors that leave the image statistics unchanged but introduce conflicting information about scene lighting conditions."
+
+The specific thresholds (forty-six observers, all college students aged 19–23, tested across two scenes — a tabletop kitchen still life and a "talking heads" library desk scene): brightness errors were highly detectable — in the library scene "observers were able to reliably detect the composited element when the brightness was increased by one step (+3.9%)" (p < 0.001), though brightness "could be decreased by three steps (−11.7%) before the error was detectable." By contrast, illumination-direction (shading) errors were only reliably detected at θ > 98° (library) and θ > 61° (kitchen), and even then "absolute levels of detection only barely exceeded 75%." Shadow-direction errors were weaker still: in the library scene "shadow direction errors were never reliably detected," and only converging shadows in the kitchen scene became detectable at θ > 15°.
+
+This is corroborated by Farid & Bravo and by Nightingale et al.: people detect blatant shadow/reflection inconsistencies (nearly 100% when shadows run in opposite directions) but are near chance for subtle ones, because "people rarely encode the details of scenes that provide useful cues."
+
+**Implications:** The cues the brain weights most heavily are **overall brightness and color/temperature consistency** (low-level image statistics), which is exactly why pros match luminance and color first and why those adjustments yield the biggest realism gains. Higher-level geometric cues (light/shadow direction) matter less perceptually — though when wrong and *noticed*, they're decisive. Color constancy (the checker-shadow illusion) shows the brain actively discounts the illuminant, which both helps (forgiving small errors) and hurts (it expects physically consistent shadows/shading) compositors.
+
+### Part 7 — Relevance to ML image harmonization
+
+The academic framing maps almost one-to-one onto the human process:
+
+- **Problem definition.** Image harmonization "aims to harmonize a composite image by adjusting foreground illumination to match background illumination" — the ML statement of the human goal of matching the FG's illumination statistics to the BG. DoveNet (Cong et al., arXiv:1911.13239) proposes "a novel domain verification discriminator, with the insight that the foreground needs to be translated to the same domain as background" — treating different illumination conditions as different domains, a learned analog of grayscale-then-color matching.
+- **iHarmony4 / DoveNet (Cong et al., CVPR 2020).** The first large-scale benchmark: 73,146 image pairs — broken down (arXiv:1908.10526) as HCOCO 42,828; HAdobe5k 21,597; HFlickr 8,277; Hday2night 256 pairs — built by adjusting the **illumination statistics** of real-image foregrounds to synthesize composites, explicitly modeling the "pixel error" class humans are most sensitive to.
+- **What signals models learn.** Early/traditional methods "match the low-level color statistics between foreground and background" — the algorithmic version of the eyedropper/Average-filter/black-white-point matching. Deep methods use attention to relate FG and BG, treat it as domain translation/style transfer, or apply **Retinex decomposition** (reflectance vs. illumination maps) — formalizing the luminance/color separation human retouchers do by hand.
+- **Beyond appearance: physical cues.** DIH-GAN (Zhongyun Bao, Chengjiang Long, Gang Fu et al., CVPR 2022, pp. 18542–18551) notes existing methods "mainly focus on foreground and background appearance consistency or the foreground object shadow generation, which rarely consider global appearance and illumination harmonization," and adds physically-based rendering and an illumination-exchange strategy. Spatially-varying illumination work handles indoor lighting that changes by location. Dedicated **shadow harmonization** work generates/blends cast shadows (avoiding "double shadows" and the "implausible, overly bright appearance" of objects placed in shade), and **CcHarmony** uses color-checker-based illumination modeling.
+
+**Bridge for the user's model design:** Humans do (a) low-level statistic matching (luminance, then color, in shadows/mids/highlights separately) and (b) physical-cue synthesis (shadows, light wrap, grain, DOF, atmosphere). Most ML harmonization models only do (a) — and the perceptual literature says (a) is where the biggest realism wins are. So: (1) An appearance/illumination-statistics model (iHarmony4/DoveNet-style) captures the highest-value human operations. (2) Consider tonal-region-aware design (separate shadow/mid/highlight transforms, mirroring lift/gamma/gain and Color Balance) and Retinex-style luminance/chroma separation, since that's how humans decompose the problem. (3) For maximum realism, treat shadow generation, light wrap, and grain/noise/DOF matching as *separate* downstream modules — humans treat them as separate steps, and unified appearance models demonstrably under-serve them. (4) Use the perceptual hierarchy (pixel errors > cue errors) to weight losses: prioritize FG–BG brightness/color-temperature statistic alignment, which is what humans and viewers care about most.
+
+## Recommendations
+
+**Staged plan for bridging human intuition to your ML model:**
+
+1. **Start with the appearance/illumination-statistics core (highest ROI).** Train or fine-tune on **iHarmony4** with a DoveNet/region-aware architecture. This captures the human steps that perceptual research shows matter most (brightness + color-temperature consistency). *Benchmark:* MSE/PSNR/fMSE on iHarmony4 test split; compare to DoveNet/HDNet baselines.
+2. **Add tonal-region awareness.** Architect the FG transform so it can apply distinct corrections in shadows/midtones/highlights (mirroring lift/gamma/gain and Color Balance) and/or a Retinex luminance–chroma split. *Threshold to adopt:* if per-region error analysis shows your model systematically misses shadow or highlight regions, add this.
+3. **Run a human-perception eval, not just pixel metrics.** Because viewers weight pixel errors > cue errors, a 2AFC "which is real" study (à la Ferwerda) is more decision-relevant than PSNR alone. *Benchmark:* fool rate / Bradley-Terry score vs. baselines.
+4. **Only then add physical-cue modules** (shadow generation, light wrap, grain/noise, DOF) as separate stages — pursue these if your target application includes inserting objects that cast shadows or sit against bright/defocused backgrounds. *Trigger:* user studies flag "floating" objects (missing contact shadow) or "too sharp/clean" FGs (missing grain/DOF) as the dominant failure mode.
+5. **Curate training data that mirrors the human error space.** Augment with realistic FG perturbations along the axes humans correct: exposure, black/white point, temperature, tint, saturation, per-region color. The "learnable augmentation" line of work (Niu et al., arXiv:2308.00376) supports this for small datasets.
+
+**What would change these recommendations:** If your use case is *object insertion into novel scenes* (AR/advertising) rather than *recoloring an existing cutout*, shadow/light-wrap synthesis moves up in priority (steps 4 before 2), because geometric grounding becomes the dominant failure. If you target *video*, grain/temporal-noise matching and defocus become first-class, not optional.
+
+## Caveats
+- **Perceptual thresholds are preliminary.** The Ferwerda et al. (2010) sensitivity numbers come from a small study (two scenes, 46 naïve college-student observers) and the authors explicitly call it preliminary; treat the *direction* of the finding (pixel > cue sensitivity) as robust, but the specific angle/percentage thresholds (+3.9%, −11.7%, θ > 61°–98°) as indicative only.
+- **Tutorial sources vary in rigor.** Much practitioner detail comes from commercial tutorial sites (PhotoshopCAFE, Photoshop Training Channel, Rebelway) and course descriptions; these reliably reflect working practice but are not peer-reviewed. The order-of-operations and named techniques are corroborated across multiple independent sources and the Wright textbook.
+- **Wright textbook quoting.** The verbatim "divide and conquer" quote is from Wright's companion volume *Compositing Visual Effects: Essentials for the Aspiring Artist*; the main textbook's exact per-step prose sits behind paywalls, but the section structure (black/white points → midtones → gamma slam → grayscale balance → flesh tones → constant-green → lighting direction) is confirmed across editions.
+- **ML field moves fast.** iHarmony4/DoveNet (2020) is foundational but the SOTA has advanced (transformer-based, high-resolution, and diffusion-based harmonization); verify current leaderboards before fixing an architecture.
+- **Human vs. ML scope mismatch.** Most academic "image harmonization" is narrowly color/illumination appearance on an already-masked FG; it does not perform masking, shadow casting, relighting, or lens/grain matching. Don't expect one model to replicate the full human pipeline.
+
+# Replicating Photoshop's RGB Image Adjustments in Code: Exact Formulas, Color Science, and Reverse-Engineered Curves
+
+## TL;DR
+- For most adjustments there are three tiers of fidelity: (a) **STANDARD/SPEC formulas** (W3C SVG/CSS, Rec.601/709/2020, sRGB, Bradford) that are exactly specified and reproduce *equivalent* results; (b) **community reverse-engineered** approximations of Photoshop's proprietary curves; and (c) a handful of **CONFIRMED** Photoshop behaviors. Photoshop's legacy operations (additive brightness, linear contrast, HSL hue/sat) are simple and reproducible; its modern operations (post-CS3 Brightness/Contrast, Vibrance, Shadows/Highlights, ACR Temperature) use proprietary, undisclosed curves and adaptive masks.
+- The single most important implementation decision is **working color space**: naive editors operate on gamma-encoded sRGB 0–255 values, but proper white balance (ACR) and physically-correct blends require **linear RGB** plus **chromatic adaptation matrices** (Bradford/von Kries in LMS cone space), not naive per-channel R/B scaling.
+- Adobe has **never published** the exact equations for its modern Brightness/Contrast, Vibrance, or Shadows/Highlights; the closest you can get is measured data points (Gerald Bakker's "Photoshop by the Numbers") and documented behavior — Adobe states modern Brightness/Contrast "applies proportionate (nonlinear) adjustments to the image layer, as with Levels and Curves adjustments."
+
+## Key Findings
+
+1. **Temperature**: True white balance is *not* R/B channel scaling. ACR works in a linear camera space and applies chromatic adaptation. The reproducible standard pipeline is: Kelvin → chromaticity (Planckian locus) → XYZ → Bradford/von Kries LMS diagonal scaling. Tanner Helland's Kelvin→RGB curve fit is the popular *approximation* for the "look."
+2. **Tint** is the orthogonal green–magenta axis of the same 2-D white-balance adjustment, implemented as a perpendicular shift in chromaticity / a green-magenta channel rebalance.
+3. **Brightness**: legacy = additive offset; modern = anchored non-linear curve (no public equation).
+4. **Contrast**: legacy linear pivot-at-0.5; the `259*(C+255)/(255*(259-C))` factor is a community formula; modern = S-curve pivoting at 128 (no public equation).
+5. **Hue rotation**: W3C defines an exact luminance-based 3×3 matrix; Photoshop's Hue/Saturation tool instead works in HSL.
+6. **Saturation**: standard luminance-interpolation formula; Vibrance is a proprietary non-linear variant.
+7. **Highlights/Shadows**: adaptive, blurred-luminance-mask local tone mapping — documented in open-source equivalents, not in Photoshop itself.
+
+## Details
+
+### 0. Foundational: luminance/luma weights and the sRGB transfer function
+
+**Luma/luminance coefficients (STANDARD):**
+- **Rec. 601** (SDTV): `Y = 0.299 R + 0.587 G + 0.114 B`
+- **Rec. 709** (HDTV/sRGB primaries): `Y = 0.2126 R + 0.7152 G + 0.0722 B`
+- **Rec. 2020** (UHDTV): `Y = 0.2627 R + 0.6780 G + 0.0593 B`
+
+Critical distinction: **luma (Y′)** is the weighted sum of *gamma-encoded* R′G′B′ values (what video and most image editors actually compute); **relative luminance (Y)** is the weighted sum of *linearized* RGB. The W3C SVG `feColorMatrix` `luminanceToAlpha` uses `0.2125 0.7154 0.0721`. Photoshop's Hue/Saturation "Lightness" and many internal greyscale conversions historically use Rec.601 weights; modern Adobe perceptual operations use Rec.709-style weights.
+
+**sRGB transfer function (STANDARD, IEC 61966-2-1):**
+
+Encode (linear → sRGB), with linear `L` and encoded `V` in [0,1]:
 ```
-out = in × amount
+V = 12.92 · L                          if L ≤ 0.0031308
+V = 1.055 · L^(1/2.4) − 0.055           if L > 0.0031308
 ```
-- `amount = 0` → black, `1` → unchanged, `2` → double brightness
-- No offset, no clipping risk on the formula itself (clamp afterward)
+Decode (sRGB → linear):
+```
+L = V / 12.92                          if V ≤ 0.04045
+L = ((V + 0.055)/1.055)^2.4            if V > 0.04045
+```
+Why it matters: operations done in gamma space vs linear space give visibly different results. Adobe Camera Raw performs demosaicing, white balance, and exposure in **linear** space; Photoshop's layer blends and most Image>Adjustments operate by default in the document's **gamma-encoded** working space (though "Blend RGB Colors Using Gamma 1.0" can force linear blending). For accurate physical results (resizing, blurring, light mixing), convert to linear first.
 
-### Simple additive offset (GPUImage shader style)
-```glsl
-gl_FragColor = vec4((textureColor.rgb + vec3(brightness)), textureColor.w);
-// brightness ∈ [-1, 1]
-```
+### 1. TEMPERATURE (white balance)
 
-### GIMP — piecewise nonlinear
-```
-if brightness < 0:  out = value × (1 + brightness)
-if brightness ≥ 0:  out = value + (1 − value) × brightness
-```
-Keeps pure black as black when brightening, avoids harsh clipping in shadows.
+**The core color-science truth (STANDARD):** Correct white balance is a *chromatic adaptation* operation, not independent R and B multiplication in gamma space. Naive scaling (`R' = R·k_r`, `B' = B·k_b`) shifts colors along channel axes and distorts hues; proper adaptation models how the human visual system re-normalizes to an illuminant by scaling responses in **LMS cone space**.
 
-### PIL/Pillow — blend toward black
+**Step A — Kelvin to chromaticity (Planckian locus).** A blackbody at temperature T has a chromaticity on the Planckian locus. The inverse (chromaticity → CCT) standard is **McCamy's cubic approximation (CONFIRMED standard, McCamy 1992):**
 ```
-out = factor × in        (blend between black image and original)
+n = (x − 0.3320) / (0.1858 − y)
+CCT = −449·n³ + 3525·n² − 6823.3·n + 5520.33
 ```
+McCamy's formula is known to provide a maximum absolute error of less than 2 K for color temperatures ranging from 2,856 K (illuminant A) to 6,500 K (D65). The forward direction (T → xy) uses the Planckian radiation integral or daylight-locus polynomial approximations.
 
----
-
-## 2. Contrast
-
-**Color space:** sRGB RGB  
-**Key idea:** scale pixel values around a **pivot point**
-
-### CSS / GIMP baseline
+**Step B — Tanner Helland's Kelvin → RGB (COMMUNITY REVERSE-ENGINEERED approximation).** The famous curve-fit, fitted to Mitchell Charity's blackbody sRGB table (CIE 1964 10° CMFs), operating on `t = T/100`. Per Helland's original 2012 article, the red approximation has an R-squared value of .988 and the green (t ≤ 66) approximation .996:
 ```
-out = (in − 0.5) × contrast + 0.5
+Red:
+  if t ≤ 66:  R = 255
+  else:       R = 329.698727446 · (t − 60)^(−0.1332047592)
+Green:
+  if t ≤ 66:  G = 99.4708025861 · ln(t) − 161.1195681661
+  else:       G = 288.1221695283 · (t − 60)^(−0.0755148492)
+Blue:
+  if t ≥ 66:  B = 255
+  elif t ≤ 19: B = 0
+  else:       B = 138.5177312231 · ln(t − 10) − 305.0447927307
+(clamp each to [0,255])
 ```
-Pivot = `0.5`. Implemented in CSS via `feComponentTransfer`:
+This is an *approximation for display*, not Photoshop's algorithm. To use it for white balance you divide the image by the target-temperature RGB (a naive von-Kries-in-sRGB), which is the simple but physically-loose method.
+
+**Step C — Proper chromatic adaptation (STANDARD, Bradford).** This is what colorimetrically-correct white balance (and ICC/ACR) does. Given source white XYZ_s and destination white XYZ_d:
+
+The **Bradford cone-response matrix M_A (CONFIRMED standard, used by ICC v2):**
 ```
-slope = contrast
-intercept = −0.5 × contrast + 0.5
+        [  0.8951   0.2664  −0.1614 ]
+M_A  =  [ −0.7502   1.7135   0.0367 ]
+        [  0.0389  −0.0685   1.0296 ]
+```
+Procedure:
+```
+(ρ_s, γ_s, β_s)ᵀ = M_A · XYZ_s        # source white in cone space
+(ρ_d, γ_d, β_d)ᵀ = M_A · XYZ_d        # dest white in cone space
+       [ ρ_d/ρ_s    0        0     ]
+D  =   [   0      γ_d/γ_s    0     ]
+       [   0        0     β_d/β_s ]
+M  = M_A⁻¹ · D · M_A
+XYZ_adapted = M · XYZ_in
+```
+**von Kries** is the same procedure but with M_A = the (sharper, less accurate) Hunt-Pointer-Estévez or even identity/XYZ-scaling matrix; Bradford is preferred. The **CAT02** matrix (from CIECAM02) is another modern alternative:
+```
+        [  0.7328  0.4296  −0.1624 ]
+M_CAT02=[ −0.7036  1.6975   0.0061 ]
+        [  0.0030  0.0136   0.9834 ]
 ```
 
-### GIMP — tangent-based (feels more perceptually even)
+**Step D — Photoshop / ACR specifics (CONFIRMED behavior, proprietary internals).** Adobe Camera Raw's Temperature slider operates on **linear** raw data and is implemented as **RGB channel multipliers in the camera's native space**, where the weights are chosen so the smallest-weight channel just reaches clipping; the conversion to output then goes raw → XYZ(D50 PCS) via an interpolated Forward Matrix → output space, with chromatic adaptation built in (Adobe DNG spec, "Process 2012"). The slider's units differ by file type (CONFIRMED, Adobe Camera Raw Help): "Camera Raw provides a true-temperature adjustment slider for raw files from 2,000 Kelvin to 50,000 Kelvin. For JPEG or TIFF files… Camera Raw does not provide the true Kelvin temperature scale. In these instances, an approximate scale of -100 to 100 is used in place of the temperature scale." RawTherapee/RawPedia documents the equivalent open pipeline: temperature+tint are translated into R/G/B channel weights in the working space (typically ProPhoto RGB). Per Adobe's Camera Raw documentation, moving the slider left makes image colors cooler (bluish) to compensate for warm light; moving right makes colors warmer (yellowish).
+
+**Bottom line for Temperature:** To replicate the *look* cheaply, use Tanner Helland + channel division in sRGB. To replicate Adobe's *correctness*, work in linear RGB, convert to XYZ, and apply a Bradford adaptation from the source white (derived from the slider's Kelvin value on the Planckian/daylight locus) to the working-space white.
+
+### 2. TINT (green–magenta)
+
+Temperature and Tint together define a 2-D point in a chromaticity plane: Temperature moves roughly along the blue↔yellow (Planckian) axis; **Tint moves perpendicular, along green↔magenta** (the "Duv"/distance-from-locus direction). Per Adobe Camera Raw Help (CONFIRMED): "Sets the white balance to compensate for a green or magenta tint. Decrease the Tint to add green to the image, or increase it to add magenta." In an LMS/channel implementation it is realized as a rebalancing of the green channel against red+blue: conceptually `G' = G·k_g` with red and blue compensated, or equivalently a shift in the v-direction of the (u,v) chromaticity before the adaptation matrix is built. There is no separate published equation; Tint is just the second degree of freedom of the same white-point selection that feeds the chromatic-adaptation matrix in §1.
+
+### 3. BRIGHTNESS
+
+**Legacy (CONFIRMED Photoshop, "Use Legacy" on):** a simple additive offset applied equally to all channels:
 ```
-slant = tan((contrast + 1) × π / 4)
-out   = (in − 0.5) × slant + 0.5
+output = input + b          (b = brightness slider, then clamp to [0,255])
 ```
-At `contrast=0`, `slant=1` → identity. As `contrast→1`, `slant→∞` → hard threshold.
+Adobe confirms: "When Use Legacy is selected, Brightness/Contrast simply shifts all pixel values higher or lower when adjusting brightness." This clips highlights/shadows and is why old B/C was disliked.
 
-### PIL/Pillow — mean as pivot
+**Standard equivalent (W3C `brightness()`):** a *multiplier*, not an offset:
 ```
-mean = average luminance of image
-out  = mean + factor × (in − mean)
+output = input · amount      (amount = 1 is unchanged; SVG feFuncR linear slope = amount)
 ```
-Keeps average lightness constant during adjustment.
+Note this is a different model from Photoshop legacy (multiply vs add).
 
-> ⚠️ Always **clamp to [0, 1]** after contrast — the SVG spec mandates clamping negatives to 0.
+**Modern (post-CS3, "Use Legacy" off — proprietary, NO public closed-form).** Adobe states (CONFIRMED, Photoshop Help) it "applies proportionate (nonlinear) adjustments to the image layer, as with Levels and Curves adjustments." Reverse-engineering (Gerald Bakker, "Photoshop by the Numbers") measured the actual mapping at Brightness +20: **0 stays 0** (black anchored), 10→11, 60→68, 128→145, the maximum push (~+21) occurs between input 160–190, then tapers (220→235, 250→253) to protect highlights. So the modern Brightness curve is an **endpoint-anchored, midtone-weighted curve** ≈ a Levels gamma (midtone slider) adjustment: `output ≈ 255·(input/255)^(1/γ)` with γ driven by the slider, which inherently fixes 0→0 and 255→255 and cannot clip. Slider range is **−150 to +150** (CONFIRMED Adobe). Working space is the document's **gamma-encoded** space (inferred from the integer-128 symmetry of the companion contrast curve). No source publishes Adobe's exact knot positions.
 
----
+### 4. CONTRAST
 
-## 3. Saturation
-
-**Three completely different methods depending on the tool:**
-
-### (a) CSS / SVG — luma-weighted RGB matrix (NOT real HSL)
+**Standard linear contrast (STANDARD/common):** pivot around mid-grey 0.5 (normalized) or 128 (8-bit):
 ```
-| R' |   | 0.213+0.787s   0.715−0.715s   0.072−0.072s | | R |
-| G' | = | 0.213−0.213s   0.715+0.285s   0.072−0.072s | | G |
-| B' |   | 0.213−0.213s   0.715−0.715s   0.072+0.928s | | B |
+output = (input − 0.5) · c + 0.5         (normalized)
+output = (input − 128) · F + 128          (8-bit)
 ```
-- `s=0` → grayscale (by luma), `s=1` → identity
-- ⚠️ MDN warns: "does not convert to HSL… may not preserve hue or lightness"
-
-### (b) Shader / GPUImage — luminance mix
-```glsl
-const vec3 luma = vec3(0.2125, 0.7154, 0.0721);
-float grey = dot(textureColor.rgb, luma);
-out = mix(vec3(grey), textureColor.rgb, saturation);
+**The widely-used contrast-factor formula (COMMUNITY, from Dreamland Fantasy Studios / "Crypt Mag"):** for a slider C in [−255, +255]:
 ```
-- `saturation=0` → gray, `1` → original, `>1` → hypersaturated
-
-### (c) True HSL saturation
+F = (259 · (C + 255)) / (255 · (259 − C))
+newChannel = clamp( F · (channel − 128) + 128 )
 ```
-RGB → HSL → multiply S → HSL → RGB
+The 259 (vs 256) is a deliberate fudge so the factor maps the −255…255 range onto ~0…129.5; at C=259 it divides by zero (image goes black), above that it inverts. This is *not* Photoshop's formula but a popular standalone one.
+
+**W3C `contrast()` (STANDARD):** `output = slope·input + intercept` with `slope = amount`, `intercept = −(0.5·amount) + 0.5` (i.e. `intercept = 0.5·(1−amount)`), pivoting at 0.5. (MDN's example uses slope=2, intercept=−0.5 for `contrast(200%)`.)
+
+**GIMP (open-source, reverse-engineerable, often cited as "Photoshop-like"):** contrast uses a **tangent slant**:
 ```
-Most "real" editors do this. Divide-by-zero risk here — see §8.
-
----
-
-## 4. Hue Rotation
-
-**Color space:** RGB (CSS matrix) OR HSV (true rotation)
-
-### CSS `hue-rotate(θ)` — exact W3C matrix
+slant = tan((contrast + 1) · π/4)         (contrast normalized to [−1,1])
+output = (input − 0.5) · slant + 0.5
 ```
-a00 = 0.213 + 0.787·cosθ − 0.213·sinθ
-a01 = 0.715 − 0.715·cosθ − 0.715·sinθ
-a02 = 0.072 − 0.072·cosθ + 0.928·sinθ
-... (full 3×3, assembled from luma constant + cosθ term + sinθ term)
+GIMP brightness (non-linear, black-preserving):
 ```
-⚠️ MDN: "It does not convert to HSL… may not preserve saturation or lightness."
-
-### True hue rotation — branchless GLSL (Rodrigues rotation around gray axis)
-```glsl
-vec3 ApplyHue(vec3 col, float hueAdjust) {
-    const vec3 k = vec3(0.57735, 0.57735, 0.57735); // normalize(1,1,1)
-    float cosAngle = cos(hueAdjust);
-    return col * cosAngle
-         + cross(k, col) * sin(hueAdjust)
-         + k * dot(k, col) * (1.0 - cosAngle);
-}
+if brightness < 0:  value = value · (1 + brightness)
+else:               value = value + (1 − value) · brightness
 ```
 
-### True hue rotation — via HSV
-```glsl
-color = hsv2rgb(rgb2hsv(color) + vec3(deltaHue / 360.0, 0.0, 0.0));
+**Modern Photoshop (post-CS3, proprietary, NO public equation).** Bakker's measurements at Contrast +20 show a **symmetric S-curve pivoting exactly at 128** (128→128 fixed), with the maximum increase (~+5) between inputs 175–208 and the maximum decrease (~−5) between 47–80, both tapering to **zero change at 0 and 255** — hence no clipping, unlike legacy. It behaves like a Curves S-curve / cubic spline whose amplitude scales with the slider. Current slider range is **−50 to +100** (CONFIRMED Adobe). No exact spline constants are published.
+
+### 5. HUE ROTATION
+
+**W3C / SVG / CSS standard matrix (STANDARD — exact).** `feColorMatrix type="hueRotate"` (and CSS `hue-rotate()`) rotate hue with a luminance-preserving 3×3 matrix built from constant weights (0.213, 0.715, 0.072) plus cos/sin terms:
+```
+| a00 a01 a02 |   [0.213 0.715 0.072]          [ 0.787 −0.715 −0.072]          [−0.213 −0.715  0.928]
+| a10 a11 a12 | = [0.213 0.715 0.072] + cos(θ)·[−0.213  0.285 −0.072] + sin(θ)·[ 0.143  0.140 −0.283]
+| a20 a21 a22 |   [0.213 0.715 0.072]          [−0.213 −0.715  0.928]          [−0.787  0.715  0.072]
+```
+e.g. a00 = 0.213 + 0.787·cosθ − 0.213·sinθ. This operates directly in RGB (matrix), does **not** convert to HSL, and therefore does *not* perfectly preserve saturation/lightness — MDN explicitly notes the hue-rotate gradient diverges from a true HSL hue sweep. By default CSS/SVG color filters compute in **linearRGB** unless `color-interpolation-filters="sRGB"` is set.
+
+The older YIQ-based luminance-preserving rotation is conceptually identical: convert RGB→YIQ, rotate the (I,Q) chroma plane by θ, convert back; the W3C matrix is the pre-multiplied form of exactly this.
+
+**Photoshop's Hue/Saturation tool (CONFIRMED different approach):** it works in **HSL**, not via the RGB rotation matrix. The Hue slider (−180…+180°) adds an angular offset to the H channel after an RGB→HSL conversion, then converts back — so it preserves S and L by construction (unlike the matrix method). To replicate Photoshop, use the HSL conversions in §8.
+
+### 6. SATURATION
+
+**Standard luminance-interpolation formula (STANDARD/common):** interpolate each pixel between its greyscale luminance and its original color:
+```
+L = w_r·R + w_g·G + w_b·B           (weights per Rec.601 or Rec.709)
+output = L + s · (input − L)         (per channel; s = saturation factor)
+```
+`s=0` → greyscale, `s=1` → unchanged, `s>1` → more saturated. This is exactly the W3C `feColorMatrix type="saturate"` matrix (STANDARD — exact), built with Rec.709-style weights 0.213/0.715/0.072:
+```
+| R' |   |0.213+0.787s  0.715−0.715s  0.072−0.072s| | R |
+| G' | = |0.213−0.213s  0.715+0.285s  0.072−0.072s| | G |
+| B' |   |0.213−0.213s  0.715−0.715s  0.072+0.928s| | B |
 ```
 
----
+**Photoshop Saturation (Hue/Saturation tool):** operates in **HSL**, scaling the S channel uniformly across all pixels — a *uniform* boost that pushes already-saturated colors to clipping and distorts skin tones.
 
-## 5. Temperature
+**Vibrance (CONFIRMED behavior, proprietary algorithm — no public equation).** Per Adobe Photoshop Help: "Vibrance adjusts the saturation so that clipping is minimized as colors approach full saturation. This adjustment increases the saturation of less-saturated colors more than the colors that are already saturated. Vibrance also prevents skin tones from becoming over saturated." So Vibrance is a **non-linear, saturation-dependent** boost (gain falls off as a pixel's current saturation rises) with an explicit skin-tone (orange/red hue range) protection. The exact weighting curve is undisclosed; community reimplementations apply a boost proportional to `(1 − currentSaturation)` and attenuate near skin hues.
 
-**Two completely different pipelines:**
+### 7. HIGHLIGHTS and SHADOWS
 
-### Raw pipeline (Lightroom / Camera Raw / DNG — photographically correct)
+This is an **adaptive, local (not global) tonal operation** and Photoshop's exact algorithm is proprietary. The documented/reverse-engineered structure (consistent across darktable, PhotoFlow, and the academic literature) is:
+
+1. Compute a luminance channel, often in log space: `LL = log10(luminance(RGB))`.
+2. **Blur** that luminance to build a low-frequency **mask** (Gaussian or, better, an edge-aware **guided/bilateral filter** to avoid halos).
+3. Apply a **tone-mapping curve** to the blurred mask that *lifts shadows and lowers highlights*, with an **anchor/midpoint** parameter splitting the shadow vs highlight regions (Photoshop exposes Amount, Tonal Width, and Radius for each of Shadows and Highlights; Radius = the blur radius of the mask).
+4. **Scale the original RGB** by the ratio of the mask after/before tone-mapping: `RGB_out = RGB_in · (mask_tonemapped / mask_blurred)`. Using a *blurred* mask (rather than per-pixel tone mapping) is what preserves **local contrast**.
+
+A representative documented local-contrast form (Moroney / Schettini, used in night-photography pipelines) is a per-pixel gamma driven by the blurred mask M:
 ```
-Temp (Kelvin) + Tint  →  CIE xy chromaticity white point
-                      →  interpolate ColorMatrix1/2 in inverse CCT (mired)
-                      →  CameraNeutral vector
-                      →  per-channel gains = 1 / CameraNeutral
-                      →  apply as diagonal multiply in camera-native linear RGB
+Ŷ = Y ^ ( γ · (0.5 − (1 − M)) / 0.5 )
 ```
-Defined in the **Adobe DNG Specification, Chapter 6**.  
-⚠️ Kelvin values are NOT portable across raw converters.
+Photoshop's "Midtone Contrast," "Black Clip," and "White Clip" sliders (CONFIRMED Adobe parameters) add a midtone S-curve and set how aggressively the extremes map to 0/255. No exact Adobe equation is published; the open-source tools above are the best faithful references.
 
-### 8-bit sRGB / web shader (GPUImage / FrontShaders)
-```glsl
-const vec3 warmFilter = vec3(0.93, 0.54, 0.0);
-// Step 1: YIQ tint shift (see §6)
-vec3 yiq = RGBtoYIQ * source.rgb;
-yiq.b = clamp(yiq.b + tint * 0.5226 * 0.1, -0.5226, 0.5226);
-vec3 rgb = YIQtoRGB * yiq;
-// Step 2: overlay-blend toward warm orange
-vec3 processed = overlay(rgb, warmFilter);  // per-channel overlay formula
-gl_FragColor = vec4(mix(rgb, processed, temperature), source.a);
+### 8. HSL and HSV ↔ RGB conversions (STANDARD — exact; needed for Hue/Saturation)
+
+**HSL → RGB** (H in [0,360), S,L in [0,1]):
 ```
-
----
-
-## 6. Tint
-
-**Axis:** green ↔ magenta (perpendicular to temperature on the color wheel)
-
-| Pipeline | Implementation |
-|---|---|
-| Raw (Lightroom) | Perpendicular offset off Planckian locus in CIE 1960 UCS |
-| LAB intuition | Shifts the **a\*** axis (green−magenta) |
-| Shader (GPUImage) | Shifts the **Q channel** in YIQ space |
-
-```glsl
-// YIQ tint shift
-yiq.b = clamp(yiq.b + tint * 0.5226 * 0.1, -0.5226, 0.5226);
+C = (1 − |2L − 1|) · S                  # chroma
+X = C · (1 − |((H/60) mod 2) − 1|)
+m = L − C/2
+(R',G',B') =
+  (C,X,0) if 0≤H<60;   (X,C,0) if 60≤H<120;  (0,C,X) if 120≤H<180;
+  (0,X,C) if 180≤H<240; (X,0,C) if 240≤H<300; (C,0,X) if 300≤H<360
+(R,G,B) = ((R'+m), (G'+m), (B'+m)) · 255
 ```
 
-**Why two axes?** Temperature fixes blue↔red(yellow) casts (daylight vs. tungsten).  
-Tint fixes green↔magenta casts (fluorescent lights, mixed sources).
-
----
-
-## 7. Shadows & Highlights
-
-**Color space:** RGB + luminance mask  
-**Key idea:** compute a mask that selects only dark (or bright) pixels, adjust luminance,
-then rescale color to preserve hue.
-
-### Gaussian mask approach (FrontShaders / bestminr)
-```glsl
-float lum = (max(r,g,b) + min(r,g,b)) / 2.0;  // HSL lightness
-
-// 2D Gaussian in (slider, luminance) space — centered at lum~0.80 for highlights
-float lum_new = lum < 0.5 ? lum
-    : lum + a * sign(highlights)
-           * exp(-0.5 * (pow((x1-b)/c, 2) + pow((x2-d)/e, 2)));
-
-// Scale color, preserve chroma — ⚠️ divide by lum (see §8!)
-gl_FragColor = vec4(color * lum_new / lum, 1.0);
+**RGB → HSL** (R,G,B in [0,1]; M=max, m=min, d=M−m):
 ```
-Constants `a, b, c, d, e` are tuned so the Gaussian peaks at `lum ≈ 0.80` for highlights
-and near `0.20` for shadows.
-
-### Simpler smoothstep approach (common in most editors)
-```glsl
-// Shadows
-float shadowMask = 1.0 - smoothstep(0.0, threshold, luma);
-out = in + amount * shadowMask;
-
-// Highlights
-float highlightMask = smoothstep(1.0 - threshold, 1.0, luma);
-out = in + amount * highlightMask;
+L = (M + m)/2
+S = 0                         if d = 0
+S = d / (1 − |2L − 1|)        otherwise
+H = 60·(((G−B)/d) mod 6)      if M=R
+H = 60·(((B−R)/d) + 2)        if M=G
+H = 60·(((R−G)/d) + 4)        if M=B
 ```
 
----
-
-## 8. Divide-by-Zero Guards
-
-The most common source of image-filter bugs.
-
-### RGB → HSL / HSV
-
+**HSV → RGB** (H in [0,360), S,V in [0,1]):
 ```
-max  = max(R, G, B)
-min  = min(R, G, B)
-delta = max − min
+i = floor(H/60);  f = H/60 − i
+p = V·(1−S);  q = V·(1−S·f);  t = V·(1−S·(1−f))
+i=0:(V,t,p) i=1:(q,V,p) i=2:(p,V,t) i=3:(p,q,V) i=4:(t,p,V) i=5:(V,p,q)
 ```
 
-| Division | When it's zero | Guard |
-|---|---|---|
-| Hue `÷ delta` | `delta=0` (gray pixels) | `if (max == min) { h = 0; s = 0; }` |
-| HSL S `÷ (2 − max − min)` | L = 0 or 1 (black/white) | caught by the `max==min` branch |
-| HSV S `÷ max` | `max=0` (pure black) | `if (max == 0) S = 0;` |
-| Shadows/Highlights `÷ lum` | `lum=0` (pure black) | `if (lum < 1e-6) skip or return color` |
-
-### Branchless GLSL (epsilon method — no `if` needed)
-```glsl
-vec3 rgb2hsv(vec3 c) {
-    vec4 K = vec4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
-    vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
-    vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
-    float d = q.x - min(q.w, q.y);
-    float e = 1.0e-10;            // ← epsilon prevents division by zero
-    return vec3(abs(q.z + (q.w - q.y) / (6.0*d + e)), d / (q.x + e), q.x);
-}
-
-vec3 hsv2rgb(vec3 c) {
-    // clamp(abs(mod(...)-3)-1) trick — zero division impossible
-    vec3 rgb = clamp(abs(mod(c.x*6.0 + vec3(0,4,2), 6.0) - 3.0) - 1.0, 0.0, 1.0);
-    return c.z * mix(vec3(1.0), rgb, c.y);  // no division at all
-}
+**RGB → HSV:**
+```
+V = M;   S = 0 if M=0 else d/M;   H computed as in HSL (same hue formula)
 ```
 
----
+## Recommendations
 
-## 9. Performance: LUTs & Approximations
+**Staged implementation plan, by fidelity target:**
 
-| Technique | How it's used |
-|---|---|
-| **256-entry LUT** | Bake brightness/contrast/gamma curve into a lookup table; one array read per channel |
-| **3D LUT texture** | Entire color grade (film emulation etc.) packed into a 3D RGB texture, sampled once per pixel |
-| **Three box blurs** | W3C SVG spec mandates this as the `feGaussianBlur` approximation for large σ — within ~3% of true Gaussian |
-| **Branchless step/mix** | Replace `if` with `step()` / `mix()` to avoid GPU warp divergence |
-| **Smooth HSV** | `rgb = rgb*rgb*(3-2*rgb)` cubic smoothing inside hsv2rgb to hide banding |
-| **Integer LUT for divide** | Embedded: precompute `round(255/170·I)` to avoid float divide in HSV |
+1. **"Good enough / web-equivalent" (start here).** Implement Saturation, Hue rotation, Brightness (multiply), and Contrast using the exact W3C SVG/CSS matrices and the linear contrast formula. These are fully specified, fast, and match browser output exactly. Use Rec.709 weights. *Threshold to move on:* if you need to match Photoshop pixel-for-pixel, these will diverge — proceed to stage 2.
 
----
+2. **"Photoshop-legacy-equivalent."** For Brightness/Contrast, implement the legacy additive/linear-pivot model (matches "Use Legacy" exactly). For Hue/Saturation, implement HSL conversions and operate on H and S channels (matches Photoshop's tool family). This reproduces Photoshop's *legacy* and *HSL-based* tools faithfully.
 
-## 10. Color Space Quick Reference
+3. **"Modern Photoshop look."** For modern Brightness/Contrast, approximate with a Levels-gamma curve (Brightness) + a 128-pivoted S-curve that tapers to zero at 0/255 (Contrast), calibrated against Gerald Bakker's measured data points; expect close-but-not-exact results since Adobe's spline is undisclosed. For Vibrance, apply a saturation-dependent gain `∝ (1 − S_current)` with orange/red-hue attenuation. Validate by differencing against Photoshop output on a test ramp; *threshold:* if max channel error > 1–2 levels matters, there is no public way to do better.
 
-| Filter | Space used | Core formula | ÷0 risk |
-|---|---|---|---|
-| Brightness (CSS) | sRGB | `in × amount` | none |
-| Brightness (offset) | RGB | `in + b` | none |
-| Brightness (GIMP) | RGB | piecewise | none |
-| Contrast (CSS) | sRGB | `(in−0.5)×c + 0.5` | none |
-| Contrast (GIMP) | RGB | `(in−0.5)×tan(…) + 0.5` | none |
-| Contrast (PIL) | RGB | `mean + f×(in−mean)` | none |
-| Saturation (CSS) | RGB matrix | 3×3 luma matrix | none |
-| Saturation (shader) | RGB+luma | `mix(grey, color, s)` | none |
-| Saturation (true) | HSL/HSV | scale S channel | **YES** |
-| Hue rotate (CSS) | RGB matrix | cos/sin 3×3 | none |
-| Hue rotate (true) | HSV | `rgb2hsv + Δh → hsv2rgb` | **YES** |
-| Temperature (raw) | Camera linear RGB | per-channel gain | normalization |
-| Temperature (shader) | YIQ + overlay | Q-shift + warm blend | none |
-| Tint | YIQ Q / LAB a* / CIE UCS | Q-channel shift | none |
-| Shadows / Highlights | RGB + luma mask | Gaussian/smoothstep × ratio | **YES** (lum=0) |
+4. **"Colorimetrically correct white balance" (Temperature/Tint).** Do **not** ship naive R/B scaling if accuracy matters. Convert sRGB→linear→XYZ, derive source white from the Kelvin/Tint point on the Planckian+daylight locus, apply a **Bradford** adaptation matrix to the working-space white, convert back. Use Tanner Helland only for a quick "warm/cool" visual filter, not for matching ACR.
 
----
+5. **Always be explicit about color space.** Decode sRGB→linear before any blur, resample, light-mixing, or physically-motivated blend; re-encode after. Do tonal/curve adjustments in gamma space if matching Photoshop's Image>Adjustments, but in linear if matching ACR.
 
-## 11. Recommended Reading
+**Benchmarks that change the plan:** if a test-chart diff against Photoshop shows hue shifts in saturated colors → you're using the RGB hue-matrix where Photoshop uses HSL (switch). If shadows/highlights show halos → your mask blur is not edge-aware (switch Gaussian → guided/bilateral). If white balance shifts skin tones unnaturally → you're scaling channels in gamma space instead of adapting in LMS.
 
-### 📐 Specs & Official Docs
-
-| Resource | Why read it |
-|---|---|
-| [W3C CSS Filter Effects Level 1](https://www.w3.org/TR/filter-effects-1/) | The authoritative spec for `brightness()`, `contrast()`, `saturate()`, `hue-rotate()` — includes the exact matrices |
-| [W3C SVG 1.1 Filter Effects](https://www.w3.org/TR/SVG11/filters.html) | `feColorMatrix`, `feComponentTransfer`, `feGaussianBlur` primitives with full math |
-| [Adobe DNG Specification (PDF)](https://www.adobe.com/content/dam/acom/en/products/photoshop/pdfs/dng_spec_1.7.0.0.pdf) | Chapter 6: how Temperature/Tint → CameraNeutral → per-channel gains works in raw pipelines |
-| [MDN: saturate()](https://developer.mozilla.org/en-US/docs/Web/CSS/filter-function/saturate) | Concise spec + the warning about HSL approximation |
-| [MDN: hue-rotate()](https://developer.mozilla.org/en-US/docs/Web/CSS/filter-function/hue-rotate) | Same matrix, clearer explanation |
-| [OpenCV Color Conversions](https://docs.opencv.org/4.x/de/d25/imgproc_color_conversions.html) | RGB↔HSV/HLS formulas, including the V=0 guard and OpenCV's 8-bit scaling |
-
----
-
-### 🔬 Color Math & Conversions
-
-| Resource | Why read it |
-|---|---|
-| [niwa.nu — Math behind RGB↔HSL](https://www.niwa.nu/2013/05/math-behind-colorspace-conversions-rgb-hsl/) | Best step-by-step walkthrough of the conversion with the `max==min` guard explained |
-| [CSS-Tricks — Converting Color Spaces in JS](https://css-tricks.com/converting-color-spaces-in-javascript/) | Practical JS code for RGB↔HSL/HSV/HWB/LAB |
-| [Patriciogonzalezvivo GLSL color gist](https://gist.github.com/patriciogonzalezvivo/114c1653de9e3da6e1e3) | The canonical GLSL color-function collection (rgb2hsv, hsv2rgb, etc.) |
-| [sqlpey — HSL/RGB across languages](https://sqlpey.com/algorithm/hsl-rgb-conversion-implementations/) | Side-by-side implementations in Python, JS, C++ |
-
----
-
-### 🎨 Shader Repositories
-
-| Resource | Why read it |
-|---|---|
-| [Shadertoy — lsSXW1](https://www.shadertoy.com/view/lsSXW1) | Color function demo — HSV/HSL in GLSL |
-| [Shadertoy — wlsSRB (Lush hsv2rgb)](https://www.shadertoy.com/view/wlsSRB) | Smooth HSV→RGB with cubic banding fix |
-| [GitHub: trevorvanhoof/ColorGrading](https://github.com/trevorvanhoof/ColorGrading) | Qt + GLSL color grading full source: shadows, highlights, saturation, hue, curves |
-| [PistonDevelopers — Useful GLSL functions](https://github.com/PistonDevelopers/shaders/wiki/Some-useful-GLSL-functions) | Concise GLSL snippets for common ops |
-
----
-
-### 🛠️ Library Source Code
-
-| Resource | Why read it |
-|---|---|
-| [Pillow ImageEnhance.py (GitHub)](https://github.com/python-pillow/Pillow/blob/main/src/PIL/ImageEnhance.py) | See exactly how PIL implements Brightness, Contrast, Color (saturation), Sharpness — blend-toward-degenerate pattern |
-| [Pillow ImageEnhance docs](https://pillow.readthedocs.io/en/stable/reference/ImageEnhance.html) | API-level docs for the same |
-
----
-
-### 📖 Tutorials & Explainers
-
-| Resource | Why read it |
-|---|---|
-| [Medium — Replicating GIMP Brightness/Contrast in Python](https://medium.com/@jsgreenawalt/replicating-gimps-brightness-contrast-adjustment-in-python-e9c962391162) | Step-by-step GIMP formula reverse-engineering with code |
-| [RawPedia — White Balance](https://rawpedia.rawtherapee.com/White_Balance) | How RawTherapee implements Temperature/Tint in a raw pipeline |
-| [scantips.com — White Balance Correction](https://www.scantips.com/lights/whitebalance2.html) | Plain-English explanation of per-channel gain method for white balance |
-| [objc.io — GPU-Accelerated Image Processing](https://www.objc.io/issues/21-camera-and-photos/gpu-accelerated-image-processing/) | How GPUImage runs filter chains on the GPU (iOS) |
-| [Red Queen Graphics — Metal Shaders: Luminance](http://redqueengraphics.com/2018/07/26/metal-shaders-luminance/) | Luminance weighting variants (Rec.601 vs 709) explained clearly |
-
----
-
-### 🔭 Deep Dives (Advanced)
-
-| Resource | Why read it |
-|---|---|
-| [colour-hdri DNG docs](https://colour-hdri.readthedocs.io/en/v0.1.3/colour_hdri.models.dng.html) | Python implementation of the full DNG color pipeline |
-| *Graphics Shaders: Theory and Practice* — Bailey & Cunningham | The textbook source for the `(0.2125, 0.7154, 0.0721)` luma weights used in GPUImage |
-| [Colour-Science Python library](https://www.colour-science.org/) | Best open-source library for "proper" color math (LAB, XYZ, CCT, camera profiles) |
-
----
-
-## Key Takeaways
-
-1. **CSS filters are matrix math on sRGB** — fast and GPU-accelerated but approximate.  
-   Use them for simple UI effects; don't expect them to match Lightroom.
-
-2. **"True" saturation/hue adjustments need HSL/HSV** — which means color-space conversion, which means divide-by-zero guards. Use the epsilon (`1e-10`) branchless GLSL approach on the GPU.
-
-3. **Temperature in raw ≠ temperature on JPEG.** Raw is per-channel linear gains from a camera matrix. JPEG/web is a YIQ Q-shift + warm overlay blend — a visual approximation.
-
-4. **Shadows/Highlights is a luminance mask + ratio rescale.** The mask (smoothstep or Gaussian) determines which tones move; the `color × lum_new / lum` preserves hue. Guard against `lum = 0`.
-
-5. **When in doubt, bake to a LUT.** Any curve you can compute per-pixel can be precomputed into a 256-entry table (1D) or 3D LUT texture and applied in one sample.
+## Caveats
+- **Adobe's modern algorithms are proprietary and undocumented.** The post-CS3 Brightness/Contrast, Vibrance, Shadows/Highlights, and the internal ACR Temperature/Tint curves have **no published equations**. All "formulas" for these are either measured data points (Gerald Bakker), behavioral descriptions from Adobe Help, or open-source analogues (GIMP/darktable/RawTherapee) that are *similar but not identical*. Photopea — a close Photoshop clone — does not reproduce Photoshop's B/C exactly.
+- The `259*(C+255)/(255*(259−C))` contrast factor and Tanner Helland's Kelvin curve are **community constructions**, popular but not used by Photoshop.
+- Luma vs luminance and Rec.601 vs Rec.709 weight choices cause real, visible differences (e.g., Rec.601 decode of Rec.709 content pushes flesh tones toward magenta). Pick weights deliberately and document them.
+- CSS/SVG filters default to **linearRGB** color-interpolation, while most naive image code assumes sRGB — the same matrix gives different output depending on this setting.
+- The sRGB piecewise constants (0.0031308 / 0.04045, 12.92, 1.055) have tiny discontinuities and are often replaced in practice by a pure gamma-2.2 approximation; this introduces small errors in deep shadows.
+- McCamy's CCT formula is accurate only within roughly the daylight range (≈2856 K–6504 K to <2 K error); outside it, use Robertson's method or two-epicenter extensions (e.g., Hernández-Andrés et al., valid 3000 K–10⁶ K).
