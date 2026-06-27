@@ -428,3 +428,71 @@ V = M;   S = 0 if M=0 else d/M;   H computed as in HSL (same hue formula)
 - CSS/SVG filters default to **linearRGB** color-interpolation, while most naive image code assumes sRGB — the same matrix gives different output depending on this setting.
 - The sRGB piecewise constants (0.0031308 / 0.04045, 12.92, 1.055) have tiny discontinuities and are often replaced in practice by a pure gamma-2.2 approximation; this introduces small errors in deep shadows.
 - McCamy's CCT formula is accurate only within roughly the daylight range (≈2856 K–6504 K to <2 K error); outside it, use Robertson's method or two-epicenter extensions (e.g., Hernández-Andrés et al., valid 3000 K–10⁶ K).
+
+import torch
+from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, SequentialLR
+
+PEAK, FLOOR, HOLD, TOTAL = 3e-4, 3e-6, 20, 60
+
+optimizer = torch.optim.Adam(model.parameters(), lr=PEAK)
+
+hold  = ConstantLR(optimizer, factor=1.0, total_iters=HOLD)        # 3e-4 for epochs 0–19
+decay = CosineAnnealingLR(optimizer, T_max=TOTAL - HOLD, eta_min=FLOOR)  # cosine 20→60
+scheduler = SequentialLR(optimizer, [hold, decay], milestones=[HOLD])
+
+for epoch in range(TOTAL):
+    train_one_epoch(...)
+    scheduler.step()
+
+File: src\train\harmonizer\trainer.py
+
+Method: _rand_adjustment_values (around line 519)
+Change:
+pythoncoarse = torch.empty(n, 1, 4, 4).uniform_(-1, 1)
+to:
+pythoncoarse = torch.empty(n, 1, 8, 8).uniform_(-1, 1)
+
+
+EfficientNet-B0 — ~5.3M parameters
+
+EfficientNet-B3 — ~12M parameters
+
+MobileNetV2 (width 1.0) — ~3.5M parameters
+So relative to your current B0:
+
+B3 is roughly 2.3× larger (~12M vs ~5.3M)
+MobileNetV2 is smaller than B0 (~3.5M vs ~5.3M)
+
+MobileNetV2
+Paul-Louis Pröve — "MobileNetV2: Inverted Residuals and Linear Bottlenecks" (best single read, clean diagrams of expand → depthwise → project, and why the bottleneck is linear):
+
+https://medium.com/data-science/mobilenetv2-inverted-residuals-and-linear-bottlenecks-8a4362f4ffd5
+MobileNetV2 Paper Walkthrough (Towards Data Science, section-by-section):
+
+https://towardsdatascience.com/mobilenetv2-paper-walkthrough-the-smarter-tiny-giant/
+GeeksforGeeks — MobileNetV2 architecture page (full layer table, 19 bottleneck layers, expansion factor 6):
+
+https://www.geeksforgeeks.org/computer-vision/mobilenet-v2-architecture-in-computer-vision/
+Original paper (arXiv 1801.04381), skim after the blogs:
+
+https://arxiv.org/abs/1801.04381
+For video, search YouTube for these two terms (the explainers are short and the visuals are what make it click): "depthwise separable convolution explained" and "MobileNetV2 inverted residual".
+EfficientNet-B0
+Arjun Sarkar — "Understanding EfficientNet — The most powerful CNN architecture" (covers compound scaling and the MBConv block):
+
+https://arjun-sarkar786.medium.com/understanding-efficientnet-the-most-powerful-cnn-architecture-eaeb40386fad
+GeeksforGeeks — EfficientNet architecture page:
+
+https://www.geeksforgeeks.org/computer-vision/efficientnet-architecture/
+viso.ai — EfficientNet overview (7-stage / 16-MBConv structure, SE modules, Swish):
+
+https://viso.ai/deep-learning/efficientnet/
+Sandaruwan Herath — block-by-block Medium series:
+
+https://medium.com/image-processing-with-python/efficientnet-a835427acf8b
+Video — "EfficientNet Explained!" (paper walkthrough, compound scaling + B0 base):
+
+https://www.youtube.com/watch?v=3svIm5UC94I
+Video — Applied Deep Learning EfficientNet Q&A lecture (deeper, lecture-style):
+
+https://www.youtube.com/watch?v=puQeiZx4JOc
