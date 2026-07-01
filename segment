@@ -496,3 +496,13 @@ https://www.youtube.com/watch?v=3svIm5UC94I
 Video — Applied Deep Learning EfficientNet Q&A lecture (deeper, lecture-style):
 
 https://www.youtube.com/watch?v=puQeiZx4JOc
+from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LambdaLR, SequentialLR
+
+optimizer = torch.optim.Adam(model.parameters(), lr=PEAK)
+
+hold = ConstantLR(optimizer, factor=1.0, total_iters=20)          # 3e-4, epochs 0–19
+cos1 = CosineAnnealingLR(optimizer, T_max=30, eta_min=MID)        # 3e-4  -> 1.5e-4, 20–50
+cos2 = LambdaLR(optimizer,                                        # 1.5e-4 -> 3e-5, 50–60
+                lambda e: cosine_between(MID, END, e / 10) / PEAK)
+
+scheduler = SequentialLR(optimizer, [hold, cos1, cos2], milestones=[20, 50])
