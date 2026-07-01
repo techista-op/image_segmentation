@@ -1,3 +1,400 @@
+#!/usr/bin/env python3
+"""
+PlotNeuralNet-style 3D-cuboid architecture figure for the per-pixel Harmonizer.
+
+Generates a LaTeX/TikZ (.tex) file in the iconic PlotNeuralNet CNN aesthetic and
+compiles it to a vector PDF. Encoder-decoder "U" laid out left->right: cuboid
+HEIGHT/DEPTH encodes spatial resolution, cuboid WIDTH encodes channel count.
+Skip connections arc over the top from encoder taps to matching decoder stages.
+
+Requires: the PlotNeuralNet repo (pycore/, layers/) and a LaTeX toolchain
+(pdflatex + standalone + tikz). Set PNN_DIR below to the repo path.
+
+Run:  python diagram_plotneuralnet.py        # writes harmonizer_pnn.tex
+      pdflatex -shell-escape harmonizer_pnn.tex
+"""
+
+import os
+import sys
+
+PNN_DIR = os.environ.get("PNN_DIR", "/tmp/pnn")
+sys.path.append(PNN_DIR)
+from pycore.tikzeng import (  # noqa: E402
+    to_generate, to_cor, to_begin, to_end, to_input, to_connection, to_skip,
+)
+
+# ----------------------------------------------------------------------------
+# Custom colored 3D box (PlotNeuralNet's to_Conv hardcodes its fill color, so we
+# roll our own Box pic to color-code encoder / decoder / bottleneck / heads).
+# ----------------------------------------------------------------------------
+def cbox(name, s_filer, n_filer, fill, to, offset="(0,0,0)",
+         width=2, height=40, depth=40, caption=" "):
+    return r"""
+\pic[shift={""" + offset + r"""}] at """ + to + r"""
+    {Box={
+        name=""" + name + r""",
+        caption=""" + caption + r""",
+        xlabel={{""" + str(n_filer) + r""", }},
+        zlabel=""" + str(s_filer) + r""",
+        fill=""" + fill + r""",
+        height=""" + str(height) + r""",
+        width=""" + str(width) + r""",
+        depth=""" + str(depth) + r"""
+        }
+    };
+"""
+
+
+def head_with_colors(projectpath):
+    """to_head + custom \\definecolor palette (Okabe-Ito-ish, section-coded)."""
+    pathlayers = os.path.join(projectpath, "layers/").replace("\\", "/")
+    return r"""\documentclass[border=8pt, multi, tikz]{standalone}
+\usepackage{import}
+\subimport{""" + pathlayers + r"""}{init}
+\usetikzlibrary{positioning}
+\usetikzlibrary{3d}
+\definecolor{StemC}{RGB}{230,159,0}
+\definecolor{EncC}{RGB}{86,180,233}
+\definecolor{BottleC}{RGB}{213,94,0}
+\definecolor{DecC}{RGB}{0,158,115}
+\definecolor{HeadC}{RGB}{204,121,167}
+"""
+
+
+# spatial size -> cuboid height/depth ; channels -> cuboid width
+def H(sz):   # spatial -> height/depth
+    return {256: 46, 128: 38, 64: 30, 32: 23, 16: 16, 8: 11}[sz]
+
+def W(ch):   # channels -> thickness (compressed so 1280 stays readable)
+    import math
+    return round(1.0 + 1.5 * math.log2(ch / 8 + 1), 1)
+
+
+arch = [
+    head_with_colors(PNN_DIR),
+    to_cor(),
+    to_begin(),
+]
+
+# --- input thumbnail (composite + mask) ---
+arch += [to_input("input_thumb.png", to="(-3.2,0,0)", width=8, height=8)]
+
+# ======================= ENCODER (EfficientNet-B0, dual-stream) ==============
+# stem: fg/bg -> concat -> 128x128x32
+arch += [cbox("stem", 128, 32, r"StemC", to="(0,0,0)",
+              width=W(32), height=H(128), depth=H(128),
+              caption=r"stem\\128{$\times$}128")]
+
+# encoder blocks; taps flagged by name reuse below
+arch += [cbox("enc2x", 128, 16, r"EncC", to="(stem-east)", offset="(1.6,0,0)",
+              width=W(16), height=H(128), depth=H(128),
+              caption=r"MBConv1\\enc2x")]
+arch += [cbox("enc4x", 64, 24, r"EncC", to="(enc2x-east)", offset="(1.6,0,0)",
+              width=W(24), height=H(64), depth=H(64),
+              caption=r"MBConv6\\enc4x")]
+arch += [cbox("enc8x", 32, 40, r"EncC", to="(enc4x-east)", offset="(1.6,0,0)",
+              width=W(40), height=H(32), depth=H(32),
+              caption=r"MBConv6\\enc8x")]
+arch += [cbox("encB", 16, 80, r"EncC", to="(enc8x-east)", offset="(1.6,0,0)",
+              width=W(80), height=H(16), depth=H(16),
+              caption=r"MBConv6")]
+arch += [cbox("enc16x", 16, 112, r"EncC", to="(encB-east)", offset="(1.2,0,0)",
+              width=W(112), height=H(16), depth=H(16),
+              caption=r"MBConv6\\enc16x")]
+
+# bottleneck 8x8x1280
+arch += [cbox("bottleneck", 8, 1280, r"BottleC", to="(enc16x-east)",
+              offset="(1.6,0,0)", width=W(1280), height=H(8), depth=H(8),
+              caption=r"head 1{$\times$}1\\enc32x")]
+
+# ======================= DECODER (U-Net) =====================================
+arch += [cbox("reduce", 8, 160, r"DecC", to="(bottleneck-east)",
+              offset="(1.6,0,0)", width=W(160), height=H(8), depth=H(8),
+              caption=r"reduce\\1{$\times$}1")]
+arch += [cbox("stage0", 16, 128, r"DecC", to="(reduce-east)", offset="(1.6,0,0)",
+              width=W(128), height=H(16), depth=H(16), caption=r"stage0")]
+arch += [cbox("stage1", 32, 96, r"DecC", to="(stage0-east)", offset="(1.6,0,0)",
+              width=W(96), height=H(32), depth=H(32), caption=r"stage1")]
+arch += [cbox("stage2", 64, 64, r"DecC", to="(stage1-east)", offset="(1.6,0,0)",
+              width=W(64), height=H(64), depth=H(64), caption=r"stage2")]
+arch += [cbox("stage3", 128, 32, r"DecC", to="(stage2-east)", offset="(1.6,0,0)",
+              width=W(32), height=H(128), depth=H(128), caption=r"stage3")]
+arch += [cbox("stage4", 256, 32, r"DecC", to="(stage3-east)", offset="(1.6,0,0)",
+              width=W(32), height=H(256), depth=H(256),
+              caption=r"stage4\\256{$\times$}256")]
+
+# ======================= REGRESSOR ===========================================
+arch += [cbox("proj", 256, 160, r"HeadC", to="(stage4-east)", offset="(1.8,0,0)",
+              width=W(160), height=H(256), depth=H(256),
+              caption=r"proj 1{$\times$}1\\32{$\to$}160")]
+arch += [cbox("heads", 256, 160, r"HeadC",
+              to="(proj-east)", offset="(1.6,0,0)",
+              width=W(64), height=H(256), depth=H(256),
+              caption=r"6 heads\\$160{\to}1$")]
+arch += [cbox("out", 256, 6, r"HeadC", to="(heads-east)", offset="(1.6,0,0)",
+              width=1.2, height=H(256), depth=H(256),
+              caption=r"args\\256{$\times$}256{$\times$}6")]
+
+# ======================= FORWARD CONNECTIONS =================================
+for a, b in [("stem", "enc2x"), ("enc2x", "enc4x"), ("enc4x", "enc8x"),
+             ("enc8x", "encB"), ("encB", "enc16x"), ("enc16x", "bottleneck"),
+             ("bottleneck", "reduce"), ("reduce", "stage0"),
+             ("stage0", "stage1"), ("stage1", "stage2"), ("stage2", "stage3"),
+             ("stage3", "stage4"), ("stage4", "proj"), ("proj", "heads"),
+             ("heads", "out")]:
+    arch += [to_connection(a, b)]
+
+# ======================= SKIP CONNECTIONS (arc over the top) =================
+# encoder tap  <->  decoder stage at matching resolution
+arch += [to_skip("enc16x", "stage0", pos=1.5)]   # 16x16
+arch += [to_skip("enc8x",  "stage1", pos=1.5)]   # 32x32
+arch += [to_skip("enc4x",  "stage2", pos=1.5)]   # 64x64
+arch += [to_skip("enc2x",  "stage3", pos=1.5)]   # 128x128
+
+arch += [to_end()]
+
+
+def main():
+    namefile = "harmonizer_pnn"
+    to_generate(arch, namefile + ".tex")
+    print("wrote", namefile + ".tex")
+
+
+if __name__ == "__main__":
+    main()
+
+#!/usr/bin/env python3
+"""
+Publication-quality architecture diagram for the per-pixel Harmonizer
+(EfficientNet-B0 dual-stream encoder -> U-Net decoder -> spatial-independent
+argument regressor -> 256x256x6 argument maps).
+
+Single-file matplotlib script. No LaTeX toolchain needed. Exports vector PDF + SVG
+plus a raster PNG preview. Uses the Okabe-Ito colorblind-safe palette.
+
+Run:  python diagram_architecture.py
+"""
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch, Circle
+from matplotlib.lines import Line2D
+
+# ----------------------------------------------------------------------------
+# Okabe-Ito colorblind-safe palette (encode MEANING, not decoration)
+# ----------------------------------------------------------------------------
+OKABE = {
+    "black":   "#000000",
+    "orange":  "#E69F00",
+    "skyblue": "#56B4E9",
+    "green":   "#009E73",
+    "yellow":  "#F0E442",
+    "blue":    "#0072B2",
+    "verm":    "#D55E00",
+    "purple":  "#CC79A7",
+    "grey":    "#BBBBBB",
+}
+C_STEM     = OKABE["orange"]    # input / stem
+C_ENCODER  = OKABE["skyblue"]   # encoder MBConv blocks
+C_TAP      = OKABE["blue"]      # tapped skip features
+C_BOTTLE   = OKABE["verm"]      # bottleneck
+C_DECODER  = OKABE["green"]     # decoder stages
+C_HEAD     = OKABE["purple"]    # regressor / heads
+C_SKIP     = "#888888"          # skip-connection arrows
+C_FLOW     = OKABE["black"]     # forward data flow
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",   # sans-serif, matches most paper bodies
+    "font.size": 8.5,
+    "svg.fonttype": "none",
+})
+
+fig, ax = plt.subplots(figsize=(17, 10))
+ax.set_xlim(0, 160)
+ax.set_ylim(-2, 100)
+ax.axis("off")
+
+
+def block(x, y, w, h, color, label, sub=None, text_color="black", z=3,
+          alpha=1.0, lw=1.0):
+    """Rounded feature-map block with a shape label under it."""
+    ax.add_patch(FancyBboxPatch(
+        (x, y), w, h,
+        boxstyle="round,pad=0.02,rounding_size=1.2",
+        linewidth=lw, edgecolor="black", facecolor=color, alpha=alpha, zorder=z))
+    ax.text(x + w / 2, y + h / 2, label, ha="center", va="center",
+            fontsize=8.5, fontweight="bold", color=text_color, zorder=z + 1)
+    if sub:
+        ax.text(x + w / 2, y - 2.4, sub, ha="center", va="top",
+                fontsize=7.2, color="#333333", zorder=z + 1)
+
+
+def flow(p0, p1, color=C_FLOW, style="-|>", lw=1.4, ls="-", z=2, rad=0.0):
+    ax.add_patch(FancyArrowPatch(
+        p0, p1, arrowstyle=style, mutation_scale=11,
+        linewidth=lw, color=color, linestyle=ls, zorder=z,
+        connectionstyle=f"arc3,rad={rad}"))
+
+
+def op_node(x, y, symbol, z=6):
+    ax.add_patch(Circle((x, y), 1.6, facecolor="white", edgecolor="black",
+                         linewidth=1.2, zorder=z))
+    ax.text(x, y, symbol, ha="center", va="center", fontsize=11,
+            fontweight="bold", zorder=z + 1)
+
+
+# ============================================================================
+# TITLE
+# ============================================================================
+ax.text(80, 97, "Per-Pixel Harmonizer — Spatial-Independent Argument Regressor",
+        ha="center", va="center", fontsize=13.5, fontweight="bold")
+ax.text(80, 93.3,
+        "EfficientNet-B0 dual-stream encoder  →  U-Net decoder (terminal 256)  →  6 independent per-pixel heads",
+        ha="center", va="center", fontsize=9, color="#444444")
+
+# ============================================================================
+# INPUT  (fg / bg)  -> STEM
+# ============================================================================
+block(3, 74, 12, 7, C_STEM, "fg", "256×256×4\n(comp+mask)", z=4)
+block(3, 61, 12, 7, C_STEM, "bg", "256×256×4\n(comp+1-mask)", z=4)
+
+# two stem convs
+block(21, 74, 12, 6, C_STEM, "conv 3×3 s2", "→128×128×16", z=4)
+block(21, 61, 12, 6, C_STEM, "conv 3×3 s2", "→128×128×16", z=4)
+flow((15, 77.5), (21, 77.5))
+flow((15, 64.5), (21, 64.5))
+
+# concat
+op_node(39, 70.5, "⊕")
+ax.text(39, 66.2, "concat", ha="center", va="top", fontsize=7, color="#333")
+flow((33, 77), (37.6, 71.8))
+flow((33, 64), (37.6, 69.2))
+
+# ============================================================================
+# ENCODER LADDER  (descending on the left arm of the U)
+# ============================================================================
+# (x, y, label, shape, is_tap, tap_name)
+enc = [
+    (45, 62, "MBConv1 ×1\n3×3 s1",  "128×128×16", True,  "enc2x"),
+    (45, 51, "MBConv6 ×2\n3×3 s2",  "64×64×24",   True,  "enc4x"),
+    (45, 40, "MBConv6 ×2\n5×5 s2",  "32×32×40",   True,  "enc8x"),
+    (45, 29, "MBConv6 ×3\n3×3 s2",  "16×16×80",   False, None),
+    (45, 18, "MBConv6 ×3\n5×5 s1",  "16×16×112",  True,  "enc16x"),
+    (45,  7, "MBConv6 ×4\n5×5 s2",  "8×8×192",    False, None),
+]
+enc_w, enc_h = 21, 8.0
+prev = (39, 69.0)  # from concat
+tap_pts = {}
+for (x, y, lab, shp, tap, tname) in enc:
+    block(x, y, enc_w, enc_h, C_ENCODER, lab, shp, z=4,
+          lw=2.4 if tap else 1.0)
+    flow(prev, (x + enc_w / 2, y + enc_h))
+    prev = (x + enc_w / 2, y)  # exit from bottom
+    if tap:
+        tap_pts[tname] = (x + enc_w, y + enc_h / 2)
+        ax.text(x + enc_w + 0.8, y + enc_h / 2, tname, fontsize=7.2,
+                color=C_TAP, fontweight="bold", ha="left", va="center")
+
+# last block -> HEAD conv -> bottleneck  (bottom of the U)
+block(45, -1.0, enc_w, 6.4, C_BOTTLE, "head 1×1  192→1280", "8×8×1280", z=4)
+flow(prev, (55.5, 5.4))
+
+# bottleneck label
+ax.text(66, 6.0, "enc32x\nBOTTLENECK", fontsize=7.2, color=C_BOTTLE,
+        fontweight="bold", ha="center", va="bottom")
+
+# ============================================================================
+# DECODER LADDER  (ascending on the right arm of the U)
+# ============================================================================
+# reduce 1x1 first (bottom center)
+block(74, -1.0, 16, 6.4, C_DECODER, "reduce 1×1  1280→160", "8×8×160", z=4)
+flow((66, 2.2), (74, 2.2))
+
+dec = [
+    (98,  7, "stage0\nup×2  +enc16x\n2×(3×3)", "16×16×128",  "enc16x"),
+    (98, 18, "stage1\nup×2  +enc8x\n2×(3×3)",  "32×32×96",   "enc8x"),
+    (98, 29, "stage2\nup×2  +enc4x\n2×(3×3)",  "64×64×64",   "enc4x"),
+    (98, 40, "stage3\nup×2  +enc2x\n2×(3×3)",  "128×128×32", "enc2x"),
+    (98, 51, "stage4\nup×2  (no skip)\n2×(3×3)", "256×256×32", None),
+]
+dec_w, dec_h = 22, 8.6
+prev = (85, 5.4)  # from reduce block top
+for (x, y, lab, shp, skipname) in dec:
+    block(x, y, dec_w, dec_h, C_DECODER, lab, shp, z=4)
+    flow(prev, (x + dec_w / 2, y))
+    prev = (x + dec_w / 2, y + dec_h)
+    if skipname and skipname in tap_pts:
+        sp = tap_pts[skipname]
+        flow(sp, (x, y + dec_h / 2), color=C_SKIP, style="-|>",
+             lw=1.2, ls=(0, (5, 3)), z=1, rad=-0.18)
+
+dec_out = (109, 59.6)  # top of stage4
+
+# ============================================================================
+# SPATIAL-INDEPENDENT REGRESSOR
+# ============================================================================
+# shared projection (single 1x1 conv, the simplified f/g)
+proj_x, proj_y, proj_w = 124, 60, 20
+block(proj_x, proj_y, proj_w, 7.0, C_HEAD, "proj 1×1  32→160", "256×256×160", z=4)
+ax.text(proj_x + proj_w / 2, proj_y - 4.0, "shared feature, read by all 6 heads",
+        ha="center", va="top", fontsize=6.6, color="#333")
+# route decoder output up-and-over to the projection
+flow(dec_out, (proj_x, proj_y + 3.5), rad=-0.12)
+
+# 6 independent heads
+head_x, head_w = 124, 22
+proj_bottom = (proj_x + proj_w / 2, proj_y)
+for i in range(6):
+    hy = 50 - i * 6.4
+    block(head_x, hy, head_w, 4.8, C_HEAD,
+          f"head {i}:  1×1 160→160 · ReLU · 1×1 160→1", None, z=4, alpha=0.93)
+    flow(proj_bottom, (head_x, hy + 2.4), color=C_HEAD, lw=0.9, z=2, rad=-0.05)
+
+# stacked output tensor
+out_x = head_x + head_w + 6
+block(out_x, 12, 12, 44, C_HEAD, "6 maps\n256×256×1\neach", "= 256×256×6",
+      z=5)
+for i in range(6):
+    hy = 50 - i * 6.4
+    flow((head_x + head_w, hy + 2.4), (out_x, 34), color=C_HEAD, lw=0.8,
+         z=2, rad=0.0)
+ax.text(out_x + 6, 9.0, "one argument\nmap per filter", ha="center", va="top",
+        fontsize=6.8, color="#333")
+
+# ============================================================================
+# LEGEND
+# ============================================================================
+legend_items = [
+    (C_STEM,    "Input / stem"),
+    (C_ENCODER, "Encoder (MBConv)"),
+    (C_TAP,     "Skip tap (bold edge)"),
+    (C_BOTTLE,  "Bottleneck"),
+    (C_DECODER, "Decoder stage"),
+    (C_HEAD,    "Regressor / heads"),
+]
+handles = [plt.Rectangle((0, 0), 1, 1, facecolor=c, edgecolor="black")
+           for c, _ in legend_items]
+handles.append(Line2D([0], [0], color=C_SKIP, lw=1.4, ls=(0, (5, 3))))
+labels = [l for _, l in legend_items] + ["Skip connection"]
+handles.append(Line2D([0], [0], color=C_FLOW, lw=1.4, marker=">", markersize=5))
+labels.append("Forward data flow")
+ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.005, 0.52),
+          fontsize=7.3, frameon=True, framealpha=0.95, ncol=1,
+          borderpad=0.7, labelspacing=0.55)
+
+# ============================================================================
+# EXPORT (vector PDF + SVG, raster PNG preview)
+# ============================================================================
+plt.tight_layout()
+for ext, dpi in [("pdf", None), ("svg", None), ("png", 200)]:
+    fig.savefig(f"harmonizer_architecture.{ext}",
+                dpi=dpi, bbox_inches="tight",
+                facecolor="white")
+print("wrote harmonizer_architecture.pdf / .svg / .png")
+
+
+
 # The Human Workflow for Image Harmonization in Compositing: A Technical Deep-Dive for ML Model Design
 
 ## TL;DR
