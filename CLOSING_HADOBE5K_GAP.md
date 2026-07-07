@@ -1,85 +1,117 @@
-# Closing the HAdobe5k Gap: Five Architectural Routes to Beat HDNet Under a 10M-Parameter Budget
+# Samsung Pro Test — Practice Questions (with online judges & test cases)
 
-## TL;DR
-- The single highest-confidence, most parameter-cheap fix is **Approach 1 (a bottleneck cosine-similarity K-NN Local Dynamic module)**: it is exactly the mechanism HDNet's ablation credits with +1.7 dB PSNR / −7.56 MSE over its own baseline, uses essentially only one 1×1 fusion conv (well under ~0.3M params at 256 channels), and directly supplies the missing foreground↔background local correspondence — fitting comfortably inside your remaining ~4.6M budget.
-- HAdobe5k is a **large / high-resolution / spatially-complex-foreground** problem, so the strongest *combination* is Approach 1 + a lightweight **two-stage residual refiner (Approach 5, CDTNet-style)**, because CDTNet, DCCF, PCT-Net and HDNet's own high-resolution tables all show the HAdobe5k win comes from adding *local, spatially-varying* correction on top of a global/parametric transform; the refiner is only ~2 conv layers (sub-0.1M params).
-- Approaches 2 (multi-scale LD) and 4 (mask-aware dynamic convs) are worthwhile but higher-risk/higher-cost per unit gain; Approach 3 (explicit background-statistics reference channels, RAIN/AdaIN-style) is the cheapest of all (near-zero params) but historically the weakest — HDNet's ablation explicitly shows K-NN LD (40.23 PSNR) beats the RAIN/spatial-attention style of guidance (39.81 PSNR).
-
-## Key Findings
-**Your diagnosis is corroborated by the literature.** Global or image-level parametric transforms (Harmonizer's white-box filters, S²CRNet's curves, CDTNet's LUTs, RainNet's single background style vector) are known to under-perform precisely on large, high-resolution, spatially-heterogeneous foregrounds, because one global adjustment cannot satisfy a foreground whose different sub-regions need different corrections. This is the exact motivation stated in HDNet, CDTNet, PCT-Net and "Image Harmonization by Matching Regional References." Your Harmonizer-style model inherits this weakness because a single 256×256×6 argument field regressed from a global bottleneck still lacks *explicit* correspondence to *which* background regions each foreground pixel should imitate.
-
-**HDNet's headline number (40.46 PSNR, 10.41M params) is itself a base U-Net + Local Dynamic (LD) + Mask-aware Global Dynamic (MGD).** Its ablation isolates the contribution: Base = 38.53 PSNR / 25.20 MSE; +LD = 40.23 / 17.64; full HDNet = 40.46 / 16.55. Per Chen et al. (ACM MM 2023, arXiv 2211.08639, Sec 4.3): "adding LD to the baseline brings 1.7 dB and 7.56 average performance improvement in terms of PSNR and MSE. Moreover, if we remove LD from HDNet, the PSNR will decrease by 0.23 dB and MSE will decrease by 2.44." So **LD alone accounts for roughly +1.7 dB of HDNet's ~1.9 dB total gain over its baseline** — the correspondence module, not the dynamic convs, is doing most of the work. Notably, HDNet found **K=1 nearest neighbor is optimal** (PSNR decreases and MSE increases as K grows), which drastically simplifies and cheapens the module.
-
-**HDNet also directly compares LD against the RAIN/spatial-attention style of guidance and wins.** Its ablation shows +LD (40.23) > +SA spatial attention (39.81) > +MGD (40.13), and the paper argues pixel-level spatial attention on hybrid encoder-decoder features is "unsuitable for such low-level texture features." This is strong evidence ranking Approach 1 above Approach 3.
+For each problem in this repo, the closest online problem(s) you can practice on with real test cases.
+Legend: 🟢 easy · 🟡 medium · 🔴 hard · ⭐ = closest/best match.
 
 ---
 
-## Details — Approach by Approach
+## Tier 1 — Dynamic Programming (do these first)
 
-### Approach 1 — Bottleneck K-NN Local Dynamic (LD) module
-**(a) Why it should work.** This is the single mechanism most directly responsible for HDNet's HAdobe5k dominance. HDNet's LD computes, at the encoder bottleneck, a cosine-similarity map S(i,j) = cos(F_f^(i), F_b^(j)) between every foreground local feature vector and every background local feature vector, selects the K-nearest background neighbors per foreground location, fuses them into a reference vector φ_ref = Σ α_k F_b^(k) (α from softmax over the K similarities), then concatenates [φ_ref, F_f] and passes through a small adaptive layer g_θ. This gives each foreground location an *explicitly matched* background appearance target — exactly the "local foreground-to-background correspondence" your diagnosis says is missing. HDNet ablation: adding LD to the baseline yields **+1.7 dB PSNR and −7.56 MSE**, and removing LD from full HDNet costs 0.23 dB / 2.44 MSE. On the high-resolution HAdobe5k test (1024×1024) HDNet reaches **41.56 PSNR vs CDTNet 38.77 and INR 38.38** (with MSE 13.24, SSIM 0.9931) — i.e., the correspondence machinery is what separates it from global-transform competitors on exactly your problem subset. The related "Image Harmonization by Matching Regional References" (Zhu et al., arXiv 2204.04715) confirms the family works: its LTL module (soft dot-product attention matching foreground locations to background locations at 32×32 — T_r = Softmax(T_f·T_bᵀ)T_b) plus a PTL patch-statistics module reaches 37.34 PSNR / 25.41 MSE on HAdobe5k with a 9.48M base model, and its ablation shows the location-matching module is the key contributor.
+### Subset-sum / min partition difference
+Files: `min_subset_diff.cpp`, `Min_Subset_Diff(2025_Test_2).cpp`
+- ⭐ [LeetCode 2035 — Partition Array Into Two Arrays to Minimize Sum Difference](https://leetcode.com/problems/partition-array-into-two-arrays-to-minimize-sum-difference/) 🔴 (exact bitset/meet-in-middle version)
+- ⭐ [GFG — Minimum sum partition](https://www.geeksforgeeks.org/problems/minimum-sum-partition3317/1) 🟡 (classic DP version)
+- [LeetCode 1049 — Last Stone Weight II](https://leetcode.com/problems/last-stone-weight-ii/) 🟡 (same problem, reworded)
+- [LeetCode 416 — Partition Equal Subset Sum](https://leetcode.com/problems/partition-equal-subset-sum/) 🟡 (warm-up)
 
-**(b) Best (cheapest) implementation.** Insert the module at your existing 8×8×256 bottleneck. The similarity computation (cosine + top-K + softmax-weighted sum) is **parameter-free** — it is pure tensor algebra on the 64 spatial tokens. The only learned weights are the fusion layer g_θ. Implement g_θ as a single 1×1 conv taking the concatenated [φ_ref ‖ F_f] (512 channels in → 256 out) = 512×256 + 256 ≈ **0.13M params**; or as a 3×3 conv ≈ 1.18M if you want more capacity. Set **K=1** (HDNet's empirically optimal value), which also removes the softmax and makes the module a pure "copy the single best-matching background feature." At 8×8 the full similarity matrix is only 64×64, so compute/memory are negligible — no need for linear-attention/Performer approximations at this resolution (those matter only at high token counts). This is by far the most favorable effort-to-gain ratio of the five.
+### Digit DP — count numbers with digit sum S
+File: `7_2_digit_sum.cpp`
+- ⭐ [GFG — Count numbers ≤ N with given digit sum](https://www.geeksforgeeks.org/dsa/count-numbers-smaller-than-or-equal-to-n-with-given-digit-sum/) 🟡 (nearly identical)
+- [LeetCode 2719 — Count of Integers](https://leetcode.com/problems/count-of-integers/) 🔴 (digit sum in a range — same technique)
+- [LeetCode 902 — Numbers At Most N Given Digit Set](https://leetcode.com/problems/numbers-at-most-n-given-digit-set/) 🔴 (digit DP + tight bound)
+- Practice more: [Codeforces — Digit DP tutorial + problem list](https://codeforces.com/blog/entry/53960)
 
-**(c) What problem it solves.** Directly addresses the missing *local correspondence*: instead of a single global background style, each foreground region is told which background region to match. It does not by itself solve fine spatial detail at high resolution (that is Approaches 2 and 5), but it is the mechanism your diagnosis identified as the core gap and the one with the strongest empirical support.
+### Interval / linear DP — stone removal cost by neighbours
+File: `4_3_stones.cpp`
+- ⭐ [Codeforces blog — the original problem/discussion](https://codeforces.com/blog/entry/117311) (approach by vgtcross, see comments)
+- Similar drill: [LeetCode 1000 — Minimum Cost to Merge Stones](https://leetcode.com/problems/minimum-cost-to-merge-stones/) 🔴
 
-### Approach 2 — Multi-scale LD (bottleneck 8×8 AND a higher-resolution skip, e.g. 32×32)
-**(a) Why it should work.** Single-scale bottleneck matching at 8×8 gives semantic correspondence but coarse spatial localization — each of the 64 tokens covers a 32×32-pixel patch of the 256×256 image, which is too coarse for the large, detailed foregrounds in HAdobe5k where lighting/color varies *within* the object. Multi-scale/hierarchical correspondence is the standard remedy: CoCosNet v2 (CVPR 2021) establishes that going to higher-resolution correspondence "not only increases the computational complexity, but also magnifies the noise and ambiguities of small patches," and solves it with a **coarse-to-fine** scheme where the low-resolution match initializes the high-resolution match. The regional-references harmonization paper's ablation directly supports the value in *this* task: applying LTL at higher decoder resolution (64×64) beat 16×16/32×32, and they settled on 32×32 only "considering the balance between the performance and computation cost." So a second LD at 32×32 should add localization precision exactly where HAdobe5k needs it.
+### 2D grid DP — robot garbage cleaning
+File: `7_1_robot.cpp`
+- Samsung-original DP (no exact LC). Closest practice for the "deploy vs. carry cost" DP pattern:
+  [LeetCode 1553 — Minimum Number of Days to Eat N Oranges](https://leetcode.com/problems/minimum-number-of-days-to-eat-n-oranges/) 🔴 (decision DP)
 
-**(b) Best (cheapest) implementation.** A naïve full similarity matrix at 32×32 is 1024×1024 tokens (≈1M entries) — an order more compute than the bottleneck but still tractable; at 64×64 it becomes 4096² and should be avoided as a dense op. Two proven cost-control patterns: (1) **Windowed/local correspondence** — restrict each foreground token's candidate background set to a local neighborhood window rather than the whole image (PatchMatch-style / local-window attention), keeping cost linear in tokens. (2) **Coarse-to-fine propagation (CoCosNet v2 / GRU-assisted PatchMatch)** — compute the match at 8×8, upsample the correspondence field, and only *refine* it locally at 32×32, avoiding the quadratic blow-up. Parameter cost is again dominated only by the fusion conv at the new scale: at 32×32 with, say, 64–128 channels a 1×1 fusion conv is ≈0.03–0.13M params. Realistically budget **~0.2–0.5M params** for a second-scale LD including a small refinement conv. Avoid a differentiable-PatchMatch ConvGRU unless you have budget headroom — the ConvGRU adds parameters and training complexity.
-
-**(c) What problem it solves.** Specifically targets the *large-foreground / high-resolution / spatially-complex* failure mode — it improves the spatial granularity of correspondence, which 8×8 matching cannot provide. This is the most "on-target" approach for HAdobe5k specifically, but it is riskier to tune (multi-scale matching can inject noise) and costs more than single-scale LD.
-
-### Approach 3 — Explicit background-statistics reference channels (RAIN/AdaIN-style guidance maps)
-**(a) Why it should work.** Instead of fusing learned embeddings, render retrieved background appearance statistics (mean color/luminance, or K-NN-matched background mean/variance) as extra spatial maps concatenated into the decoder input. This is the RainNet/RAIN philosophy (Ling et al., CVPR 2021, arXiv 2106.02853): treat harmonization as background→foreground style transfer, extract background feature mean γ and variance β, and apply them to normalized foreground features via AdaIN. RAIN is a proven drop-in module — its ablation shows adding RAIN to the DIH baseline lifts PSNR from 33.36 dB to 33.84 dB (+0.48 dB). "Image Harmonization by Matching Regional References" uses exactly this in its PTL module — it transfers background patch statistics (μ, σ) to foreground locations weighted by content similarity, at 128×128 resolution, precisely because full attention is too expensive at high resolution and statistics are cheap.
-
-**(b) Best (cheapest) implementation.** Nearly **parameter-free**. Compute per-foreground-location matched background mean/std (either global background statistics à la AdaIN, or K-NN-matched à la PTL) and concatenate these 3–6 extra channels to the decoder/regressor input; the only added params are the widened first conv that ingests the extra channels (a few thousand params). RAIN itself adds only the affine transfer — no large learned matrices. This is the cheapest of all five approaches and the most interpretable (you can visualize the reference map).
-
-**(c) What problem it solves.** Provides explicit background appearance guidance, but as a *statistic* rather than a *matched embedding*. Crucially, HDNet's ablation directly pits this style against LD and LD wins (+LD 40.23 vs +SA spatial-attention 39.81), and RainNet's own iHarmony4 average (36.12 PSNR / 40.29 MSE / 469.60 fMSE; 36.22 PSNR on HAdobe5k specifically) trails LD-based HDNet substantially (40.46 avg / 41.17 HAdobe5k). Interpretation: statistic-based guidance captures global tone but loses the fine, content-specific matching that large foregrounds need. **Recommendation: use this only as a near-free add-on or ablation baseline, not as your primary fix.**
-
-### Approach 4 — Mask-aware Dynamic (MGD)-style separate conv kernels for foreground vs background
-**(a) Why it should work.** HDNet's MGD predicts distinct convolution kernels for foreground vs background regions: F′_m = (F_m ⊛ W_f) ⊗ M + (F_m ⊛ W_b) ⊗ M̄, so each region "can be regarded as being assigned an individual decoder... without introducing extra computational cost, since all regions share the same encoder." The kernels are generated dynamically via adaptive-average-pool → two 1×1 convs (the DRConv-style filter generator). This lets the decoder apply region-specialized transformations. HDNet ablation: +MGD gives 40.13 PSNR vs 38.53 base (though note much of this overlaps with LD's contribution). The lineage is Dynamic Region-Aware Convolution (DRConv, CVPR 2021), CondConv, and dynamic convolution.
-
-**(b) Best (cheapest) implementation.** The efficient pattern (from DRConv and HDNet) is a **filter generator**: adaptive-average-pool the feature map to k×k, then two 1×1 conv layers (first with sigmoid, second grouped) predict the region kernels. Because it predicts *two* kernel sets (fg/bg) rather than N=8 (CondConv) or N=4 (DyConv), it is far cheaper than generic dynamic convolution — the literature warns CondConv/DyConv "heavily increase the model size." Concretely, per Chen et al. (Dynamic Convolution, CVPR 2020, Table 2), MobileNetV2 ×1.0 with CondConv (K=8 kernels) = 27.5M params / 329M MAdds / 74.6% top-1, vs DY-CNNs (K=4) = 11.1M / 312.9M / 75.2%, vs a static baseline of ~3.5M — i.e., stacking many candidate kernels is exactly where the blow-up comes from. Restricting to 2 region-kernels and applying MGD to only a few decoder layers keeps the addition to roughly **~0.3–1M params** depending on channel width and how many layers you convert. Do NOT convert every decoder conv to dynamic.
-
-**(c) What problem it solves.** Gives the decoder region-conditioned capacity so foreground and background are transformed by specialized filters — helps global visual consistency and lets the network learn a dedicated foreground mapping. It does *not* by itself add local correspondence (it is a per-region, not per-match, mechanism), so it is complementary to Approach 1 rather than a substitute. HDNet uses both together; its numbers suggest LD contributes more than MGD.
-
-### Approach 5 — Two-stage lightweight residual refinement (CDTNet-style)
-**(a) Why it should work.** This is the field's canonical answer to *high-resolution* harmonization. CDTNet (CVPR 2022) combines a low-resolution pixel-to-pixel generator, an RGB-to-RGB LUT color-mapping module, and a **lightweight refinement module** that fuses both to "compensate for fine-grained local information." The insight (CDTNet Fig. 1): global RGB-to-RGB transform "can obtain a globally reasonable tone and illumination [but] may produce inharmonious local regions," while dense pixel transform gives local detail but is resolution-limited — so you combine them. This is *exactly* your situation: your filter-argument regression is the global/parametric stage (good on HCOCO/HFlickr/Hday2night), and a residual refiner adds the local correction HAdobe5k needs. DCCF (ECCV 2022) and PCT-Net (CVPR 2023) follow the same low-res-predict/high-res-apply philosophy; PCT-Net wins on HAdobe5k, HCOCO and HFlickr, losing only on data-starved Hday2night.
-
-**(b) Best (cheapest) implementation.** CDTNet's refinement module is remarkably small: "two convolution layers with kernel 3 and stride 1, each followed by a batch normalization and an ELU," plus an image-blending layer; it ingests the H×W×(c+7) concatenation of upsampled decoder features + the global-transform output and produces the refined image. That is on the order of **<0.1M params**. Keep stage 1 (your existing regressor + FilterPerformer) frozen or jointly trained; add stage 2 as a residual (predict Δ, add to stage-1 output) operating only inside the masked foreground. For the **loss-conflict** issue you flagged: CDTNet resolves it by simply *summing* losses on each stage's output — L = L_pix (low-res pixel loss) + L_rgb (global-transform loss) + L_ref (refinement reconstruction L1 to ground truth) — i.e., supervise each stage against the ground-truth image separately rather than forcing one loss to serve both parametric and dense objectives. This mirrors coarse-to-fine practice broadly: keep the coarse/parametric loss on the coarse output and put a separate fine/dense (L1 or MSE) loss on the refined output, so the parametric head is never asked to minimize a pixel-dense objective it structurally cannot.
-
-**(c) What problem it solves.** Directly targets *high-resolution / large-foreground* residual errors that a single global parametric pass leaves behind — the CDTNet/DCCF/PCT-Net consensus fix for HAdobe5k. It does not add explicit correspondence (that is Approach 1) but is highly complementary and extremely cheap, making Approach 1 + Approach 5 the most attractive combination under your budget.
+### State-machine DP — string merge (first char == last char)
+File: `5_1_strings.cpp`
+- Samsung-original DP over digit-start/end states. No exact judge match — drill it directly from this repo (write your own test cases). Conceptual cousin: [LeetCode 2317 style state DP].
 
 ---
 
-## Summary Table — Estimated Added Parameter Cost
-| # | Approach | Mechanism added | Est. added params | Primary problem solved | Evidence strength |
-|---|----------|-----------------|-------------------|------------------------|-------------------|
-| 1 | Bottleneck K-NN LD | Cosine sim + K=1 match + 1×1 fusion conv | **~0.13M** (1×1) to ~1.2M (3×3) | Local fg↔bg correspondence | **Strongest** (HDNet +1.7 dB ablation) |
-| 2 | Multi-scale LD (add 32×32) | 2nd LD, windowed/coarse-to-fine + fusion conv | **~0.2–0.5M** | High-res spatial granularity of correspondence | Strong (CoCosNet v2; LTL@64×64 ablation) |
-| 3 | Background-statistics ref channels | AdaIN/RAIN-style stat maps concatenated | **~0.005–0.05M** (near-free) | Explicit but coarse background guidance | Weak-moderate (RAIN +0.48 dB on DIH; < LD in HDNet) |
-| 4 | Mask-aware dynamic convs (MGD) | Filter generator → 2 region kernels, few layers | **~0.3–1M** | Region-conditioned decoder capacity | Moderate (MGD ablation, overlaps LD) |
-| 5 | Two-stage residual refiner | 2× conv3×3 + BN + ELU + blend, residual | **<0.1M** | High-res/large-foreground residual detail | Strong (CDTNet/DCCF/PCT-Net for HAdobe5k) |
+## Tier 1 — Binary Search on the Answer
 
-**Budget arithmetic (base 5.4M, ceiling 10M → ~4.6M headroom):** Every single approach fits with enormous room to spare. Even the most aggressive *combination* — Approach 1 (3×3 fusion, 1.2M) + Approach 2 (0.5M) + Approach 4 (1M) + Approach 5 (0.1M) ≈ **+2.8M → ~8.2M total** — stays under 10M. The parameter budget is therefore *not* your binding constraint; correspondence quality and tuning risk are.
+### Threshold / minimize-the-maximum
+Files: `4_2_tiles.cpp` (2D prefix + BS), `5_2_scores.cpp`
+- ⭐ [LeetCode 410 — Split Array Largest Sum](https://leetcode.com/problems/split-array-largest-sum/) 🔴 (canonical "minimize the max")
+- ⭐ [LeetCode 875 — Koko Eating Bananas](https://leetcode.com/problems/koko-eating-bananas/) 🟡 (canonical BS-on-answer)
+- [LeetCode 1283 — Find the Smallest Divisor Given a Threshold](https://leetcode.com/problems/find-the-smallest-divisor-given-a-threshold/) 🟡
+- [LeetCode 1631 — Path With Minimum Effort](https://leetcode.com/problems/path-with-minimum-effort/) 🟡 (BS on answer + grid, close to the tiles idea)
 
-## Recommendations
-**Stage 1 — do this first (highest expected value, lowest cost/risk).** Implement Approach 1: a K=1 cosine-similarity Local Dynamic module at your 8×8×256 bottleneck with a single 1×1 fusion conv (~0.13M params, new total ~5.5M). This is the mechanism HDNet's own ablation credits with the bulk of its gain and it directly plugs your diagnosed gap. **Benchmark to watch:** HAdobe5k PSNR. If you close most of the HAdobe5k gap and your average clears ~40.46, you may already beat HDNet at roughly half its parameters — stop here.
+---
 
-**Stage 2 — if HAdobe5k still trails after LD.** Add Approach 5 (CDTNet-style residual refiner, <0.1M params, foreground-masked, supervised with a separate L1/MSE on the refined output while keeping the filter-argument loss on stage 1). This is cheap and specifically attacks high-resolution residual error. **Threshold:** adopt if LD alone leaves HAdobe5k > ~0.3 dB below HDNet's 41.17 (256×256).
+## Tier 1 — BFS / DFS + grid simulation
 
-**Stage 3 — if you need more HAdobe5k localization.** Add Approach 2 (second LD at 32×32, windowed or coarse-to-fine to control cost, ~0.2–0.5M). Only pursue if Stages 1–2 plateau, because multi-scale matching is the hardest to tune and can inject noise. **Threshold:** try if HAdobe5k is still the worst-relative subset after Stages 1–2.
+### Grid + collect items under a cost (warehouse truck)
+File: `4_1_warehouse.cpp`
+- ⭐ [LeetCode 847 — Shortest Path Visiting All Nodes](https://leetcode.com/problems/shortest-path-visiting-all-nodes/) 🔴 (bitmask BFS — the core technique)
+- ⭐ [LeetCode 864 — Shortest Path to Get All Keys](https://leetcode.com/problems/shortest-path-to-get-all-keys/) 🔴 (grid + bitmask BFS — closest overall)
 
-**Optional / lower priority.** Approach 4 (MGD) is a reasonable capacity add if you have budget and want to mirror full HDNet, but its ablation gain overlaps LD's, so expect diminishing returns after Approach 1. Approach 3 (statistics channels) is nearly free — implement it as a quick ablation/baseline, but do not rely on it as the primary fix; HDNet's evidence says matched embeddings beat matched statistics.
+### Grid movement simulation (right-turn-only apples)
+File: `apples.cpp`
+- Samsung-original simulation. Practice the family on Samsung sets:
+  [SW Expert Academy](https://swexpertacademy.com/) · [Baekjoon "삼성 SW 역량테스트 기출" workbook](https://www.acmicpc.net/step) · [GitHub — SWEA solutions](https://github.com/sjnov11/SW-expert-academy)
+- Similar grid-sim on LC: [LeetCode 885 — Spiral Matrix III](https://leetcode.com/problems/spiral-matrix-iii/) 🟡
 
-**What would change these recommendations:** If profiling shows your bottleneck features are not semantically discriminative enough for cosine matching to find good neighbors (e.g., LD gives < ~0.5 dB), the problem is representation quality, not correspondence — in that case prioritize Approach 5's dense refiner and Approach 2's higher-resolution features over more bottleneck matching. If inference latency (not params) becomes the constraint, drop Approach 2's high-res matching first, as it is the most compute-heavy.
+### Robot cutting/loading with ordering (logging trees)
+File: `logging_trees.cpp`
+- Samsung-original. Same source sets as above (SWEA / Baekjoon Samsung workbook).
 
-## Caveats
-- **HDNet's per-subset HAdobe5k figures and total are from the ACM MM 2023 paper's tables** (10.41M params; 40.46 avg PSNR; 41.17 HAdobe5k PSNR at 256×256; 41.56 at 1024×1024). These are author-reported; independent reproduction of HDNet has been noted as non-trivial, so treat the exact deltas as indicative.
-- **Parameter estimates for the added modules are my own calculations** from the described layer shapes (1×1/3×3 conv param counts at your stated channel widths), not figures lifted from the papers, because most harmonization papers report total model size rather than per-module counts. Treat them as order-of-magnitude budgeting, not exact.
-- **PCT-Net's exact parameter count is not published** — the paper only describes it as "light-weight" and plots model size on a 0–20M axis without a numeric label; a follow-up (AICT, NeurIPS 2024) places it in the ~4–19M band. Its strong HAdobe5k results (full/native-resolution ViT variant: 39.97 PSNR / 19.35 MSE / 149.39 fMSE) are reported at native resolution, not 256×256; its 256×256 per-subset breakdown sits in supplementary material.
-- **The K=1 optimum is specific to HDNet's setup** (256×256 training, their bottleneck resolution and channel count). Your bottleneck is 8×8×256 with a dual-stream EfficientNet-B0 encoder, which differs; re-sweep K ∈ {1,3,5} on your own model rather than assuming K=1.
-- **The regional-references matching mechanism is softmax dot-product attention, not cosine-similarity KNN** (authors are Zhu et al., not Wang et al.); its LTL runs at 32×32 and PTL on 128×128 patch statistics. It is corroborating evidence for the correspondence family but is not a literal implementation of HDNet's cosine-KNN LD.
-- **Loss-conflict resolution (Approach 5) is inferred from CDTNet's additive multi-loss design** (L = L_pix + L_rgb + L_ref); it is a proven pattern but you will still need to tune the relative weights against your existing per-argument supervision, especially given your finding that stricter per-argument supervision (λ=16) hurt.
-- Some sources encountered were preprints/aggregators; all core numbers here (HDNet, Harmonizer, CDTNet, RAIN, DRConv/DyConv, CoCosNet v2, regional-references, PCT-Net) trace to the primary CVPR/ECCV/ACM MM/NeurIPS/arXiv papers or their official code.
+---
+
+## Tier 2 — Graphs & Trees
+
+### Tree rerooting — sum over all nodes
+File: `min_cost.cpp`
+- ⭐ [LeetCode 834 — Sum of Distances in Tree](https://leetcode.com/problems/sum-of-distances-in-tree/) 🔴 (exact rerooting technique)
+- Reference: [Codeforces — rerooting blog](https://codeforces.com/blog/entry/63962)
+
+### Tree DFS balancing (equal sibling subtree sums)
+File: `soldiers.cpp`
+- Samsung-original tree DFS. Warm-up on tree DFS: [GFG — Tree traversals / subtree sum](https://www.geeksforgeeks.org/problems/) ; drill directly from repo.
+
+### Prefix sum + hashmap — balanced necklace
+File: `3_RB.cpp`
+- ⭐ [LeetCode 525 — Contiguous Array](https://leetcode.com/problems/contiguous-array/) 🟡 (exact: longest subarray with equal counts → answer = N − that length)
+
+---
+
+## Tier 2 — Backtracking (from `text.txt` notes)
+- [LeetCode 51 — N-Queens](https://leetcode.com/problems/n-queens/) 🔴
+- [LeetCode 52 — N-Queens II](https://leetcode.com/problems/n-queens-ii/) 🔴
+- [LeetCode 37 — Sudoku Solver](https://leetcode.com/problems/sudoku-solver/) 🔴
+
+## Tier 2 — Stock buy/sell DP (from `text.txt` notes)
+- [LeetCode 123 — Best Time to Buy and Sell Stock III](https://leetcode.com/problems/best-time-to-buy-and-sell-stock-iii/) 🔴 (≤2 transactions)
+- [LeetCode 188 — Best Time to Buy and Sell Stock IV](https://leetcode.com/problems/best-time-to-buy-and-sell-stock-iv/) 🔴 (≤k transactions)
+
+---
+
+## Tier 3 — Segment Tree (flagged "Imp" in notes)
+- [GFG — Range Minimum Query (practice)](https://www.geeksforgeeks.org/problems/range-minimum-query/1) 🟡
+- [SPOJ GSS1 — Can you answer these queries I](https://www.spoj.com/problems/GSS1/) 🔴
+- [Codeforces EDU — Segment Tree course](https://codeforces.com/edu/course/2/lesson/4) (best structured practice)
+
+---
+
+## Repo problems with no exact online judge (drill from this repo)
+These are Samsung-original — write your own test cases from the statements in `Test - 1.docx`:
+- **Test 1** — points on a rectilinear lattice path (coordinate compression + interval search)
+- **Test 2** — warehouse inventory min days (greedy + sorting, `2_days.cpp`)
+- **Test 6** — cars to a point, drive t moves on turn t (math/parity + triangular numbers, `6_1_cars.cpp`)
+
+---
+
+## Suggested mapping to the 4-day plan
+- **Day 1 (DP):** LC 416 → 1049 → 2035, then GFG Minimum sum partition; LC 1000 for interval DP.
+- **Day 2 (BS-on-answer + digit DP):** LC 875 → 410 → 1283 → 1631; GFG digit-sum → LC 2719/902.
+- **Day 3 (graphs/trees/grids):** LC 864 → 847; LC 834; LC 525; a couple SWEA grid sims.
+- **Day 4 (backtracking + review):** LC 51 → 52 → 37; LC 123 → 188; timed redo of weak spots.
